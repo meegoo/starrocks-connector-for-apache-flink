@@ -50,4 +50,6 @@ public interface StreamLoadManager {
     }
 
     default void setMetricListener(MetricListener metricListener) {}
+
+    default void setCommitAllowed(boolean allowed) {}
 }

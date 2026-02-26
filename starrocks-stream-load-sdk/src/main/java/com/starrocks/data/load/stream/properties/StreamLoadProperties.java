@@ -48,6 +48,7 @@ public class StreamLoadProperties implements Serializable {
     private final Map<String, StreamLoadTableProperties> tablePropertiesMap;
 
     private final boolean enableTransaction;
+    private final boolean enableMultiTableTransaction;
 
     // manager settings
     /**
@@ -116,6 +117,7 @@ public class StreamLoadProperties implements Serializable {
         this.starRocksVersion = StarRocksVersion.parse(version);
 
         this.enableTransaction = builder.enableTransaction;
+        this.enableMultiTableTransaction = builder.enableMultiTableTransaction;
 
         this.labelPrefix = builder.labelPrefix;
 
@@ -157,6 +159,10 @@ public class StreamLoadProperties implements Serializable {
 
     public boolean isEnableTransaction() {
         return enableTransaction;
+    }
+
+    public boolean isEnableMultiTableTransaction() {
+        return enableMultiTableTransaction;
     }
 
     public String getJdbcUrl() {
@@ -330,6 +336,7 @@ public class StreamLoadProperties implements Serializable {
         private String version;
 
         private boolean enableTransaction;
+        private boolean enableMultiTableTransaction;
 
         private String labelPrefix = "";
 
@@ -405,6 +412,11 @@ public class StreamLoadProperties implements Serializable {
 
         public Builder enableTransaction() {
             this.enableTransaction = true;
+            return this;
+        }
+
+        public Builder enableMultiTableTransaction() {
+            this.enableMultiTableTransaction = true;
             return this;
         }
 

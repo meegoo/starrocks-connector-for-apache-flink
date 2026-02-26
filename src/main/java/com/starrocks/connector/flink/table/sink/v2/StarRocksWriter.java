@@ -141,6 +141,7 @@ public class StarRocksWriter<InputT>
             return;
         }
         sinkManager.write(rowData.getUniqueKey(), rowData.getDatabase(), rowData.getTable(), rowData.getRow());
+        sinkManager.setCommitAllowed(rowData.isTransactionEnd());
         totalReceivedRows += 1;
         if (totalReceivedRows % 100 == 1) {
             LOG.debug("Received raw record: {}", element);

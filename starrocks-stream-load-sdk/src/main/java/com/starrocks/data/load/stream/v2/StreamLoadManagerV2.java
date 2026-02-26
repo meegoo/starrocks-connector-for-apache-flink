@@ -49,6 +49,11 @@ public class StreamLoadManagerV2 implements StreamLoadManager, Serializable {
     }
 
     @Override
+    public void setCommitAllowed(boolean allowed) {
+        delegateManager.setCommitAllowed(allowed);
+    }
+
+    @Override
     public void write(String uniqueKey, String database, String table, String... rows) {
         delegateManager.write(uniqueKey, database, table, rows);
     }
