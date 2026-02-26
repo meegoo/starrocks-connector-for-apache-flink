@@ -460,3 +460,152 @@ FE 多次切主（02-24 ~ 02-25）
 2. **Vacuum 层**：在删除文件前，验证没有比 `min_retain_version` 更早的 metadata 版本仍引用这些文件（但这会增加 I/O 开销）。
 3. **FE 层**：加强 FE 切主后的 visibleVersion 一致性校验，例如从 S3 读取实际最新 metadata version 来校准。
 4. **txn_log 清理**：vacuum 不应删除 `force_publish` 事务的 txn_log，或者在删除前检查 txn_log 对应的版本是否已经 safely retained。
+
+---
+
+## 八、修正分析：排除 "Compaction B" 假设
+
+### 8.1 用户反馈
+
+> "Compaction B 执行时已经找不到文件了，说明不是B导致的"
+
+这否定了之前的 "二次 Compaction + vacuum 删除 + publish 重试" 假设。关键逻辑：
+
+**如果 Compaction B 要把 segment_X 作为输入，Compaction B 的执行阶段必须能读到 segment_X 文件。文件已经不存在了，Compaction B 不可能成功执行，因此不可能把 segment_X 移入 `compaction_inputs`。**
+
+### 8.2 重新分析：排除 Compaction B 后的可能删除路径
+
+系统中能删除 segment/SST 文件的所有代码路径：
+
+| # | 删除路径 | 代码位置 | 触发条件 | 适用性 |
+|---|---------|---------|---------|--------|
+| 1 | `collect_garbage_files` → `compaction_inputs` | `vacuum.cpp:228-249` | 版本的 compaction_inputs 中有该文件 | 需要 compaction 消费过该文件 |
+| 2 | `collect_garbage_files` → `orphan_files` | `vacuum.cpp:252-263` | 版本的 orphan_files 中有该文件 | SST 可能（通过 SST compaction），segment 不太可能 |
+| 3 | `datafile_gc` (`find_orphan_data_files`) | `vacuum.cpp:1113-1211` | 所有存活 metadata 都不引用该文件 + 超过 expired_seconds | 需要一个 metadata 空窗期 |
+| 4 | `abort_txn` → `collect_files_in_log` | `transactions.cpp:541-579` | compaction txn 被 abort → 删除 compaction **输出** segments | 需要 txn 被错误 abort |
+| 5 | `delete_tablets` → `delete_files_under_txnlog` | `vacuum.cpp:713-747` | tablet 被删除时，读 txn_log 删除 compaction **输出** | tablet 仍活跃，不适用 |
+
+### 8.3 Issue 3（SST 文件丢失）—— 跨时间线 orphan_files（不需要 Compaction B）
+
+SST 文件与 segment 文件的关键区别：**SST 是 persistent index 文件，生命周期长，可能在 FE 切主之前就已存在。**
+
+#### 可能场景
+
+```
+Timeline A（切主前的 old leader）:
+  v_old:   sstable_meta = [SST_A]
+  v_comp:  SST compaction: SST_A → orphan_files, SST_B → sstable_meta
+           prev_garbage_version = v_old（因 orphan_files 非空）
+
+FE 切主 → visibleVersion 回退到 v_old 之前
+
+Timeline B（new leader）:
+  new v_old:  sstable_meta = [SST_A]（继承自回退的 base_version，SST compaction 没发生）
+  new v_old+1: ...仍引用 SST_A...
+
+S3 上混合状态:
+  v_old ~ v_comp-1: new leader 的 metadata（SST_A 在 sstable_meta）
+  v_comp+: old leader 的 metadata（SST_A 在 orphan_files）
+```
+
+当 vacuum 运行时：
+1. 沿 `prev_garbage_version` 链到达 v_comp（old leader 的）
+2. 从 v_comp 的 `orphan_files` 收集 SST_A → **删除 SST_A**
+3. 但 new leader 的 metadata 仍在 `sstable_meta` 中引用 SST_A → 404
+
+**此场景不需要 Compaction B。** old leader 时间线上的 SST compaction 就是直接原因。
+
+#### 验证方式
+
+- 确认 SST_A 的创建时间是否在 FE 切主之前
+- 在 old leader 的日志中搜索是否有 SST compaction 记录
+- 检查 `prev_garbage_version` 链是否跨越了时间线
+
+### 8.4 Issue 2（segment 文件丢失）—— 待进一步排查
+
+这是更难解释的 case。segment `0000000003cfb698_87198a2e-...` 由 Compaction A (txn 63944344) 在 **02-25 03:16** 创建，发生在最后一次 FE 切主（02-25 02:27）之后。因此：
+
+- **old leader 从未拥有过此 segment** → 跨时间线 compaction_inputs 路径不适用
+- **Compaction B 无法成功执行** → 二次 Compaction 路径不适用
+
+#### 候选路径 1：`abort_txn` 删除 compaction 输出
+
+`abort_txn` 中的 `collect_files_in_log`（`transactions.cpp:551-558`）会删除 compaction 的 **输出** segments：
+
+```cpp
+if (txn_log.has_op_compaction()) {
+    size_t new_segment_offset = txn_log.op_compaction().new_segment_offset();
+    size_t new_segment_count = txn_log.op_compaction().new_segment_count();
+    const auto& segments = txn_log.op_compaction().output_rowset().segments();
+    for (size_t idx = new_segment_offset, cnt = 0; ...) {
+        files_to_delete->emplace_back(tablet_mgr->segment_location(tablet_id, segments[idx]));
+    }
+}
+```
+
+**如果 Compaction A 的 txn 被错误 abort，其输出 segment 会被直接删除。**
+
+可能触发条件：
+- FE 切主后，new leader 不知道此 txn 已 VISIBLE（VISIBLE edit log 丢失）
+- New leader 看到此 txn 处于 COMMITTED 状态，但 publish 失败
+- 某种条件触发 abort（超时、冲突等）
+- `LakeTableTxnStateListener.postAbort()` 发送 `AbortTxnRequest` 到 CN
+- CN 的 `abort_txn()` 读取 txn_log，删除 compaction 输出 segment
+
+**但存在疑点**：Compaction A 在 03:16 成为 VISIBLE，这是在最后一次 FE 切主（02:27）之后。除非有未记录的 FE 切主/重启。
+
+**验证方式**：在 FE/CN 日志中搜索 `abort.*63944344` 或 `abort.*3cfb698`。
+
+#### 候选路径 2：vacuum metadata 删除 + datafile_gc 时间窗口
+
+1. Vacuum 删除中间 metadata 版本（v787637 到 v791755 之间）
+2. 在某个瞬间，S3 上没有 metadata 引用此 segment（取决于 new/old leader metadata 的覆盖情况）
+3. datafile_gc 恰好在此窗口运行，识别 segment 为孤儿
+4. 但 `expired_seconds` 保护应该防止这种情况（文件只创建了几小时）
+
+**验证方式**：检查 `lake_datafile_gc_expired_seconds` 配置值。
+
+#### 候选路径 3：跨时间线 metadata 覆盖
+
+虽然 Compaction A 在 FE 切主后执行，但如果之前的 FE 切主导致此 partition 的 visibleVersion 已经混乱：
+
+1. 02-24 的某次 FE 切主导致此 partition 的 visibleVersion 低于实际
+2. New leader 从旧 base 开始 publish，覆盖了 S3 上的部分 metadata
+3. 后来 Compaction A 执行并 publish（v787637）
+4. 但 vacuum 基于的 `prev_garbage_version` 链可能经过了 被覆盖的旧 metadata
+5. 旧 metadata 的 `compaction_inputs` 中可能有 **不同的** compaction 留下的垃圾文件条目，这些条目恰好包含与此 segment 同名的文件？
+
+这种可能性极低，因为 segment 文件名包含 txn_id 前缀，不会重复。
+
+### 8.5 修正后的结论
+
+| Issue | 最可能的删除路径 | 置信度 | 需要进一步验证 |
+|-------|-----------------|--------|---------------|
+| Issue 2 (segment) | `abort_txn` 删除 compaction 输出 | 中 | 搜索 abort 日志 |
+| Issue 2 (segment) | 跨时间线 metadata 覆盖 + datafile_gc | 低 | 检查 expired_seconds 配置 |
+| Issue 3 (SST) | 跨时间线 orphan_files（old leader 的 SST compaction） | 高 | 确认 SST 创建时间和 old leader SST compaction 记录 |
+
+**Issue 3 的解释不依赖 "Compaction B"**，直接通过跨时间线的 orphan_files 即可解释。
+
+**Issue 2 的确切删除路径仍不完全明确**，`abort_txn` 是当前最可疑的路径，但需要日志验证。
+
+### 8.6 关键验证建议
+
+1. **在 FE 日志中搜索 Compaction A (txn 63944344) 是否有被 abort 的记录**：
+   ```
+   grep "63944344" fe.log* | grep -i abort
+   ```
+
+2. **在 CN 日志中搜索 abort_txn 调用**：
+   ```
+   grep "abort_txn.*63944344\|abort_txn.*3cfb698" cn.log*
+   ```
+
+3. **检查 FE 切主后是否有其他未记录的 FE 重启**：
+   ```
+   grep "notify new FE type" fe.log* | grep "2026-02-25"
+   ```
+
+4. **检查 datafile_gc 的 expired_seconds 配置值**
+
+5. **确认 SST 文件 `40ca5914-...-b1cc2e.sst` 的 S3 创建时间**（是否在 02-24 FE 切主之前）
