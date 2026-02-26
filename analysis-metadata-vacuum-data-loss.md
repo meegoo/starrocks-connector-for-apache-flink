@@ -274,3 +274,189 @@ FE 多次切主（02-24 ~ 02-25）
 | Issue 1 和 Issue 2 的关联 | ✅ 正确 | 同一次 FE 切主的不同表现形式 |
 
 **总体评价：原始分析的方向正确，核心结论可信，但 "Scenario 1" 的描述过于简化，实际路径更可能是 "二次 Compaction + vacuum 删除 + publish 重试" 的组合。两个 Issue 确实由同一个根因（FE 切主丢 edit log）触发，但通过不同路径表现。**
+
+---
+
+## 六、Issue 3：SST 文件丢失（合并分析）
+
+### 6.1 问题概述
+
+| 项目 | 值 |
+|------|------|
+| 丢失文件 | `40ca5914-dcd3-4023-912c-a32306b1cc2e.sst`（persistent index SST, ~1.2GB） |
+| Tablet | 40569331 (hex: 26B09F3) |
+| Table | contact_merge_fields (40451012) |
+| Partition | 40569261 (p4) |
+| DB | cdp (40429389) — 与 Issue 2 同一 DB |
+| 最后正常版本 | v724963, publish 于 02-25 14:33:06 |
+| 报错时间 | 02-25 15:37:29 |
+| 恢复时间 | 02-25 19:23:09（通过 DROP PERSISTENT INDEX 重建） |
+
+### 6.2 SST 文件的生命周期（代码分析）
+
+SST 文件是 Primary Key 表的持久化索引文件，与 segment 数据文件有不同的管理路径：
+
+**1. SST 在 metadata 中的位置**
+
+SST 文件存储在 `sstable_meta.sstables[]` 中（非 `rowsets[]`）：
+
+```
+"sstable_meta": {
+    "sstables": [
+        {"filename": "40ca5914-...-b1cc2e.sst", "filesize": 1278320278},
+        {"filename": "4a9f5efe-...-b39ca7.sst", "filesize": 48220900}
+    ]
+}
+```
+
+**2. SST 何时变为垃圾**
+
+SST 文件通过以下路径移入 `orphan_files`，等待 vacuum 清理：
+
+| 路径 | 代码位置 | 触发条件 |
+|------|----------|----------|
+| SST compaction | `meta_file.cpp:322-331` `remove_compacted_sst()` | compaction 的 `input_sstables` 被新 SST 替换 |
+| PK index 重建 | `txn_log_applier.cpp:201-210` `check_rebuild_index()` | `rebuild_pindex=true` 时，旧 SST 移入 `orphan_files`，`sstable_meta` 清空 |
+| 持久化索引类型变更 | `meta_file.cpp:622-640` `_sstable_meta_clean_after_alter_type()` | 从 CLOUD_NATIVE 切到 LOCAL 类型 |
+| Full replication | `txn_log_applier.cpp:670-678` | 全量复制时旧 SST 成为孤儿 |
+| PK recover | `lake_primary_key_recover.cpp:35` | PK 恢复时直接 `clear_sstable_meta()` |
+
+**3. vacuum 如何删除 SST**
+
+- **路径 A：`collect_garbage_files`** — 从 `orphan_files` 收集（`vacuum.cpp:252-263`）。如果某版本的 metadata 有 SST 在 `orphan_files` 中，vacuum 沿 `prev_garbage_version` 链遍历到该版本时会删除它。
+- **路径 B：`datafile_gc`** — `list_data_files` 明确包含 SST（`vacuum.cpp:1093` `is_sst(entry.name)`），而 `check_reference_files` 检查 `sstable_meta`（`vacuum.cpp:1146-1150`）。如果没有存活 metadata 的 `sstable_meta` 引用该 SST，它会被识别为孤儿。
+
+### 6.3 根因分析：与 Issue 2 相同的模式
+
+**SST 文件丢失的机制与 segment 丢失完全一致，只是涉及不同的 metadata 字段。**
+
+#### 场景复现
+
+```
+Step 1: 版本 V_old (≤724963) 的 sstable_meta 引用 SST_A
+
+Step 2: SST Compaction 发生（版本 V_comp, 724963 < V_comp < 724966）
+  - SST_A 从 sstable_meta 移出，加入 orphan_files
+  - 新的 SST_B 加入 sstable_meta
+  - prev_garbage_version 指向 V_old（因为 orphan_files 非空）
+
+Step 3: vacuum 运行
+  - 沿 prev_garbage_version 链遍历到 V_comp
+  - 从 V_comp 的 orphan_files 收集 SST_A → 删除 SST_A 文件
+  - 删除 V_comp 的 txn_log
+  - 删除中间 metadata 版本
+
+Step 4: Publish 重试（FE 切主导致 visibleVersion 回退）
+  - 从 V_old（≤724963）重新 publish
+  - SST Compaction 的 txn_log 已被删除
+  - force_publish=true → 跳过 SST Compaction
+  - 新 metadata 的 sstable_meta 仍引用 SST_A（因为 compaction 被跳过）
+
+Step 5: 02-25 15:37:29 publish 尝试加载 PK index
+  - 读取 sstable_meta → 尝试加载 SST_A → 404 Not Found
+  - "prepare_primary_index: load primary index failed: Not found"
+```
+
+#### 代码层面的关键证据
+
+1. **`remove_compacted_sst` 将旧 SST 移入 `orphan_files`**（`meta_file.cpp:322-331`）：
+
+```cpp
+void MetaFileBuilder::remove_compacted_sst(const TxnLogPB_OpCompaction& op_compaction) {
+    for (auto& input_sstable : op_compaction.input_sstables()) {
+        FileMetaPB file_meta;
+        file_meta.set_name(input_sstable.filename());
+        file_meta.set_size(input_sstable.filesize());
+        file_meta.set_shared(input_sstable.shared());
+        _tablet_meta->mutable_orphan_files()->Add(std::move(file_meta));
+    }
+}
+```
+
+2. **`collect_garbage_files` 无条件删除 `orphan_files` 中的文件**（`vacuum.cpp:252-263`）：
+
+```cpp
+for (const auto& file : metadata.orphan_files()) {
+    if (retain_info.contains_file(file.name())) {
+        continue;
+    }
+    RETURN_IF_ERROR(deleter->delete_file(join_path(base_dir, file.name())));
+}
+```
+
+3. **`force_publish` 跳过 compaction 时，SST compaction 也被跳过**（`transactions.cpp:387-391`）：
+
+```cpp
+if (ignore_txn_log) {
+    log_applier->observe_empty_compaction();
+    continue;  // SST compaction 的所有效果（包括更新 sstable_meta）都被跳过
+}
+```
+
+### 6.4 与 Issue 2 的对比
+
+| 维度 | Issue 2 (segment 丢失) | Issue 3 (SST 丢失) |
+|------|------------------------|---------------------|
+| 丢失文件类型 | segment .dat（数据文件） | persistent index .sst（索引文件） |
+| metadata 引用位置 | `rowsets[].segments[]` | `sstable_meta.sstables[]` |
+| 变为垃圾的方式 | compaction 后加入 `compaction_inputs` | SST compaction 后加入 `orphan_files` |
+| vacuum 删除路径 | `collect_garbage_files` → `compaction_inputs` | `collect_garbage_files` → `orphan_files` |
+| 重新引入引用的方式 | publish 重试跳过 data compaction | publish 重试跳过 SST compaction |
+| 表现 | 查询 404 | publish 失败（PK index load failed） |
+| 同一集群 | ✅ | ✅ |
+| 同一次 FE 切主事件 | ✅ | ✅ |
+| 同一天暴露 | ✅ (02-25 14:48) | ✅ (02-25 15:37) |
+
+### 6.5 时间线
+
+```
+02-24 03:28:09   FE 切主 #1（BDB JE quorum rollback）
+...              多次 FE 切主
+02-25 02:27:23   FE 切主 #7
+02-25 14:33:06   partition 40569261 publish 成功 v724963（SST_A 在 sstable_meta 中）
+                 ... SST_A 被错误删除 ...
+02-25 14:48:02   Issue 2 暴露：segment 404（另一个 partition 40588770）
+02-25 15:37:29   Issue 3 暴露：SST 404（partition 40569261）
+02-25 19:23:09   通过 DROP PERSISTENT INDEX 重建后 publish 成功 v724966
+                 SST_A 被加入 orphan_files（因为重建后用了新的 index）
+```
+
+两个 issue 在 **同一天、相隔不到 1 小时** 暴露，影响 **同一 DB 下不同表的不同 partition**。这进一步证实了系统性根因（FE 切主丢 edit log）。
+
+## 七、统一结论
+
+### 7.1 三个 Issue 的统一根因
+
+```
+FE 多次切主（02-24 ~ 02-25）
+  └→ BDB JE quorum rollback 丢失 edit log
+      ├→ Issue 1: nextVersion 未递增 → 版本重复
+      ├→ Issue 2: visibleVersion 回退 → publish 重试跳过 data compaction
+      │           → vacuum 已删除的 segment 重新被引用 → 查询 404
+      └→ Issue 3: visibleVersion 回退 → publish 重试跳过 SST compaction
+                  → vacuum 已删除的 SST 重新被引用 → PK index load 404
+```
+
+### 7.2 核心漏洞总结
+
+系统存在一个 **"vacuum-publish 不变量违反"** 问题：
+
+**不变量**：vacuum 删除的文件，不应再被任何后续 metadata 引用。
+
+**违反条件**：
+1. compaction（data 或 SST）将旧文件标记为垃圾（`compaction_inputs` 或 `orphan_files`）
+2. vacuum 删除旧文件 + txn_log
+3. publish 重试从旧 base_version 重建 metadata，跳过 compaction（`force_publish` + txn_log 缺失）
+4. 重建的 metadata 引用了已被 vacuum 删除的文件
+
+**触发条件**：
+- FE 切主导致 visibleVersion 回退（最常见）
+- batch → single publish 模式切换 + FE 响应丢失
+- CN 重启 + FE 未更新 visibleVersion
+
+### 7.3 修复方向建议
+
+1. **Publish 层**：当 `force_publish` 跳过 compaction 时，应检查旧文件是否仍存在于 S3。如果不存在，不应使用旧 metadata 的引用。
+2. **Vacuum 层**：在删除文件前，验证没有比 `min_retain_version` 更早的 metadata 版本仍引用这些文件（但这会增加 I/O 开销）。
+3. **FE 层**：加强 FE 切主后的 visibleVersion 一致性校验，例如从 S3 读取实际最新 metadata version 来校准。
+4. **txn_log 清理**：vacuum 不应删除 `force_publish` 事务的 txn_log，或者在删除前检查 txn_log 对应的版本是否已经 safely retained。
