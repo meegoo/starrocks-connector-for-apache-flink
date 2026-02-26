@@ -126,17 +126,25 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         return true;
     }
 
+    @Override
+    public boolean beginTransaction(String label, String database, String table) {
+        return doBegin(label, database, table);
+    }
+
     protected boolean doBegin(TableRegion region) {
+        return doBegin(region.getLabel(), region.getDatabase(), region.getTable());
+    }
+
+    protected boolean doBegin(String label, String database, String table) {
         String host = getAvailableHost();
         String beginUrl = getBeginUrl(host);
-        String label = region.getLabel();
         log.info("Transaction start, label : {}", label);
 
         HttpPost httpPost = new HttpPost(beginUrl);
         httpPost.setHeaders(beginTxnHeader);
         httpPost.addHeader("label", label);
-        httpPost.addHeader("db", region.getDatabase());
-        httpPost.addHeader("table", region.getTable());
+        httpPost.addHeader("db", database);
+        httpPost.addHeader("table", table);
 
         httpPost.setConfig(RequestConfig.custom()
                         .setSocketTimeout(properties.getSocketTimeout())
@@ -144,16 +152,14 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
                         .setRedirectsEnabled(true)
                         .build());
 
-        String db = region.getDatabase();
-        String table = region.getTable();
-        log.info("Transaction start, db: {}, table: {}, label: {}, request : {}", db, table, label, httpPost);
+        log.info("Transaction start, db: {}, table: {}, label: {}, request : {}", database, table, label, httpPost);
 
         try (CloseableHttpClient client = clientBuilder.build()) {
             String responseBody;
             try (CloseableHttpResponse response = client.execute(httpPost)) {
-                responseBody = parseHttpResponse("begin transaction", region.getDatabase(), region.getTable(), label, response);
+                responseBody = parseHttpResponse("begin transaction", database, table, label, response);
             }
-            log.info("Transaction started, db: {}, table: {}, label: {}, body : {}", db, table, label, responseBody);
+            log.info("Transaction started, db: {}, table: {}, label: {}, body : {}", database, table, label, responseBody);
 
             JsonNode node = objectMapper.readTree(responseBody);
             JsonNode statusNode = node.get("Status");
@@ -163,7 +169,7 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
                 String errMsg = String.format("Can't find 'Status' in the response of transaction begin request. " +
                         "Transaction load is supported since StarRocks 2.4, and please make sure your " +
                         "StarRocks version support transaction load first. db: %s, table: %s, label: %s, response: %s",
-                        db, table, label, responseBody);
+                        database, table, label, responseBody);
                 log.error(errMsg);
                 throw new StreamLoadFailException(errMsg);
             }
@@ -173,7 +179,7 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
             }
 
             String errMsg = String.format("Transaction start failed, db: %s, table: %s, label: %s, responseBody: %s",
-                    region.getDatabase(), region.getTable(), label, responseBody);
+                    database, table, label, responseBody);
             throw new StreamLoadFailException(errMsg);
         } catch (StreamLoadFailException se) {
             throw se;

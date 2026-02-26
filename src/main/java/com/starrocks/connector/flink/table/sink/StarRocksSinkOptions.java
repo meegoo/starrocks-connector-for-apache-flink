@@ -116,6 +116,11 @@ public class StarRocksSinkOptions implements Serializable {
     public static final ConfigOption<Boolean> SINK_AT_LEAST_ONCE_USE_TRANSACTION_LOAD = ConfigOptions.key("sink.at-least-once.use-transaction-stream-load")
             .booleanType().defaultValue(true).withDescription("Whether to use transaction stream load for at-least-once when it's available.");
 
+    public static final ConfigOption<Boolean> SINK_MULTI_TABLE_TXN_ENABLED = ConfigOptions.key("sink.transaction.multi-table.enabled")
+            .booleanType().defaultValue(false).withDescription("Whether to enable multi-table atomic transaction. " +
+                    "When enabled, all tables written within the same flush cycle share one StarRocks transaction label, " +
+                    "and are atomically committed together. Requires StarRocks >= 4.0 and sink.version=V2.");
+
     public static final ConfigOption<Integer> SINK_MAX_RETRIES = ConfigOptions.key("sink.max-retries")
             .intType().defaultValue(3).withDescription("Max flushing retry times of the row batch.");
 
@@ -336,6 +341,10 @@ public class StarRocksSinkOptions implements Serializable {
 
     public boolean getSinkAtLeastOnceUseTransactionStreamLoad() {
         return tableOptions.get(SINK_AT_LEAST_ONCE_USE_TRANSACTION_LOAD);
+    }
+
+    public boolean isMultiTableTransactionEnabled() {
+        return tableOptions.get(SINK_MULTI_TABLE_TXN_ENABLED);
     }
 
     public Map<String, String> getSinkStreamLoadProperties() {
@@ -606,6 +615,11 @@ public class StarRocksSinkOptions implements Serializable {
                         || getSinkAtLeastOnceUseTransactionStreamLoad())) {
             builder.enableTransaction();
             log.info("Enable transaction stream load");
+        }
+        if (isMultiTableTransactionEnabled()) {
+            builder.enableTransaction();
+            builder.enableMultiTableTransaction();
+            log.info("Enable multi-table transaction stream load");
         }
         return builder.build();
     }

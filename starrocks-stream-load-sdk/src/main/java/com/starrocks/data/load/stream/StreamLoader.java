@@ -31,6 +31,18 @@ public interface StreamLoader {
     void close();
 
     boolean begin(TableRegion region);
+
+    /**
+     * Begin a transaction with an explicit label. Used by multi-table transaction mode
+     * where multiple tables share one transaction label. StarRocks v4.0+ allows
+     * subsequent /api/transaction/load calls to target different tables under this label.
+     *
+     * @return true if the transaction was successfully begun
+     */
+    default boolean beginTransaction(String label, String database, String table) {
+        return true;
+    }
+
     Future<StreamLoadResponse> send(TableRegion region);
 
     Future<StreamLoadResponse> send(TableRegion region, int delayMs);

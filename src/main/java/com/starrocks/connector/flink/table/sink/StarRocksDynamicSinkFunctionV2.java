@@ -142,6 +142,7 @@ public class StarRocksDynamicSinkFunctionV2<T> extends StarRocksDynamicSinkFunct
                     return;
                 }
                 sinkManager.write(data.getUniqueKey(), data.getDatabase(), data.getTable(), data.getRow());
+                sinkManager.setCommitAllowed(data.isTransactionEnd());
                 return;
             }
             // raw data sink
