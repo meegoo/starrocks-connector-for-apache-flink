@@ -46,14 +46,46 @@ public class FlushAndCommitStrategy implements StreamLoadStrategy {
     private final AtomicLong numCacheTriggerFlush = new AtomicLong(0);
     private final AtomicLong numTableTriggerFlush = new AtomicLong(0);
 
+    /**
+     * Whether commit is allowed for the current source transaction.
+     *
+     * <p>In multi-table transaction mode the upstream source controls when a logical
+     * transaction ends by sending a special "transaction-end" marker row.  Until that
+     * marker arrives, the sink must buffer data without committing it to StarRocks even
+     * if the flush interval has elapsed.  Once the marker is received the flag is set
+     * to {@code true} and the next manager-thread scan will commit all pending regions.
+     *
+     * <p>In normal (non-multi-table) mode this flag is always {@code true} so the
+     * existing age-based commit behaviour is unchanged.
+     */
+    private final boolean multiTableTransactionEnabled;
+    private volatile boolean commitAllowed;
+
     public FlushAndCommitStrategy(StreamLoadProperties properties, boolean enableAutoCommit) {
         this.expectDelayTime = properties.getExpectDelayTime();
         this.scanFrequency = properties.getScanningFrequency();
         this.ageThreshold = expectDelayTime / scanFrequency;
         this.maxCacheBytes = properties.getMaxCacheBytes();
         this.enableAutoCommit = enableAutoCommit;
+        this.multiTableTransactionEnabled = properties.isEnableMultiTableTransaction();
+        // In non-multi-table mode commit is always allowed (preserves original behaviour).
+        this.commitAllowed = !multiTableTransactionEnabled;
 
         LOG.info("{}", this);
+    }
+
+    /**
+     * Sets whether commit is allowed for the current source transaction.
+     *
+     * <p>Only meaningful when {@link #multiTableTransactionEnabled} is {@code true}.
+     * Calling this with {@code true} unblocks the next age-triggered commit cycle;
+     * calling it with {@code false} re-arms the guard for the next transaction.
+     */
+    public void setCommitAllowed(boolean allowed) {
+        if (multiTableTransactionEnabled) {
+            this.commitAllowed = allowed;
+            LOG.debug("setCommitAllowed: {}", allowed);
+        }
     }
 
     @Override
@@ -99,7 +131,20 @@ public class FlushAndCommitStrategy implements StreamLoadStrategy {
     }
     
     public boolean shouldCommit(TableRegion region) {
-        return enableAutoCommit && region.getAge() > ageThreshold;
+        return enableAutoCommit && commitAllowed && region.getAge() > ageThreshold;
+    }
+
+    /**
+     * Returns whether commit is currently allowed.
+     * Always {@code true} in non-multi-table mode.
+     */
+    public boolean isCommitAllowed() {
+        return commitAllowed;
+    }
+
+    /** Returns whether multi-table transaction mode is enabled. */
+    public boolean isMultiTableTransactionEnabled() {
+        return multiTableTransactionEnabled;
     }
 
     @Override
@@ -110,6 +155,8 @@ public class FlushAndCommitStrategy implements StreamLoadStrategy {
                 ", ageThreshold=" + ageThreshold +
                 ", maxCacheBytes=" + maxCacheBytes +
                 ", enableAutoCommit=" + enableAutoCommit +
+                ", multiTableTransactionEnabled=" + multiTableTransactionEnabled +
+                ", commitAllowed=" + commitAllowed +
                 ", numAgeTriggerFlush=" + numAgeTriggerFlush +
                 ", numCacheTriggerFlush=" + numCacheTriggerFlush +
                 ", numTableTriggerFlush=" + numTableTriggerFlush +

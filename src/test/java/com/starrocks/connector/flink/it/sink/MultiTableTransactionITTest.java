@@ -1,0 +1,558 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.starrocks.connector.flink.it.sink;
+
+import com.starrocks.connector.flink.it.StarRocksITTestBase;
+import com.starrocks.connector.flink.table.data.DefaultStarRocksRowData;
+import com.starrocks.connector.flink.table.sink.SinkFunctionFactory;
+import com.starrocks.connector.flink.table.sink.StarRocksSinkOptions;
+import com.starrocks.data.load.stream.properties.StreamLoadTableProperties;
+import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.streaming.api.datastream.DataStream;
+import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.math.BigDecimal;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+import static com.starrocks.connector.flink.it.sink.StarRocksTableUtils.scanTable;
+import static com.starrocks.connector.flink.it.sink.StarRocksTableUtils.verifyResult;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * Integration tests for multi-table atomic transaction stream load.
+ *
+ * <p>Requires StarRocks >= 4.0 for multi-table transaction support.
+ *
+ * <p>Run against an external cluster:
+ * <pre>
+ *   mvn test -Dtest=MultiTableTransactionITTest \
+ *     -Dit.starrocks.fe.http=172.26.95.228:8030 \
+ *     -Dit.starrocks.fe.jdbc=jdbc:mysql://172.26.95.228:9030
+ * </pre>
+ *
+ * <h2>Test coverage</h2>
+ * <ol>
+ *   <li>{@link #testEndToEndMultiPartition} — end-to-end write with parallelism=2 and
+ *       per-partition routing; verifies data correctness across two tables.</li>
+ *   <li>{@link #testNoFlushBeforeTxnEnd} — transaction consistency: data must NOT be
+ *       visible before txnEnd, and MUST be visible shortly after.</li>
+ *   <li>{@link #testMultipleConsecutiveTransactions} — consecutive transaction isolation:
+ *       txn-2 data must not be committed until txn-2's own txnEnd arrives (re-arm logic).</li>
+ *   <li>{@link #testEmptyTransaction} — boundary: a txnEnd with no preceding data must
+ *       not cause errors.</li>
+ * </ol>
+ */
+public class MultiTableTransactionITTest extends StarRocksITTestBase {
+
+    private static final Logger LOG = LoggerFactory.getLogger(MultiTableTransactionITTest.class);
+
+    /**
+     * Flush interval used in timing-sensitive tests (ms).
+     * Must be larger than the SDK's minimum scanningFrequency (50 ms).
+     */
+    private static final int FLUSH_INTERVAL_MS = 500;
+
+    /**
+     * How long to wait after a txnEnd row is emitted before asserting that data
+     * is visible in StarRocks (ms).
+     *
+     * <p>With the event-driven commit implementation, the task thread executes
+     * {@code switchChunk} immediately on txnEnd, then the manager thread drives:
+     * HTTP load (~100 ms) → prepare (~50 ms) → commit (~50 ms).
+     * We add a 2 s buffer for CI/network variance.
+     */
+    private static final long COMMIT_PROPAGATION_MS = 2_000L;
+
+    // -------------------------------------------------------------------------
+    // DDL helpers
+    // -------------------------------------------------------------------------
+
+    private String createOrdersTable() throws Exception {
+        String tableName = "orders_" + genRandomUuid();
+        executeSrSQL(String.format(
+                "CREATE TABLE `%s`.`%s` (" +
+                        "order_id BIGINT NOT NULL," +
+                        "customer_id BIGINT NOT NULL," +
+                        "total_amount DECIMAL(10,2) DEFAULT '0'," +
+                        "order_status VARCHAR(32) DEFAULT ''" +
+                        ") ENGINE=OLAP PRIMARY KEY(order_id) " +
+                        "DISTRIBUTED BY HASH(order_id) BUCKETS 4 " +
+                        "PROPERTIES (\"replication_num\" = \"1\")",
+                DB_NAME, tableName));
+        return tableName;
+    }
+
+    private String createOrderItemsTable() throws Exception {
+        String tableName = "order_items_" + genRandomUuid();
+        executeSrSQL(String.format(
+                "CREATE TABLE `%s`.`%s` (" +
+                        "item_id BIGINT NOT NULL," +
+                        "order_id BIGINT NOT NULL," +
+                        "product_name VARCHAR(128) DEFAULT ''," +
+                        "quantity INT DEFAULT '0'," +
+                        "price DECIMAL(10,2) DEFAULT '0'" +
+                        ") ENGINE=OLAP PRIMARY KEY(item_id) " +
+                        "DISTRIBUTED BY HASH(item_id) BUCKETS 4 " +
+                        "PROPERTIES (\"replication_num\" = \"1\")",
+                DB_NAME, tableName));
+        return tableName;
+    }
+
+    // -------------------------------------------------------------------------
+    // Test cases
+    // -------------------------------------------------------------------------
+
+    /**
+     * End-to-end test: two source partitions, sink parallelism = 2.
+     *
+     * <p>Verifies the core routing contract: {@code keyBy(sourcePartition)} ensures
+     * each sink subtask handles exactly one partition, so one partition's data is
+     * always processed by the same sink instance.
+     *
+     * <ul>
+     *   <li>Partition 0 → {@code orders} table (2 rows + txnEnd)</li>
+     *   <li>Partition 1 → {@code order_items} table (3 rows + txnEnd)</li>
+     * </ul>
+     *
+     * <p>After the job finishes ({@code close()} flushes remaining data), both
+     * tables must contain the expected rows.
+     */
+    @Test
+    public void testEndToEndMultiPartition() throws Exception {
+        String ordersTable = createOrdersTable();
+        String orderItemsTable = createOrderItemsTable();
+
+        StreamExecutionEnvironment env = buildEnv(2);
+
+        DataStream<DefaultStarRocksRowData> partition0 = env.fromElements(
+                row(DB_NAME, ordersTable,
+                        "{\"order_id\":1,\"customer_id\":100,\"total_amount\":99.99,\"order_status\":\"created\"}",
+                        0, false),
+                row(DB_NAME, ordersTable,
+                        "{\"order_id\":2,\"customer_id\":101,\"total_amount\":25.00,\"order_status\":\"created\"}",
+                        0, true)
+        ).returns(TypeInformation.of(DefaultStarRocksRowData.class));
+
+        DataStream<DefaultStarRocksRowData> partition1 = env.fromElements(
+                row(DB_NAME, orderItemsTable,
+                        "{\"item_id\":1,\"order_id\":1,\"product_name\":\"widget\",\"quantity\":2,\"price\":49.99}",
+                        1, false),
+                row(DB_NAME, orderItemsTable,
+                        "{\"item_id\":2,\"order_id\":1,\"product_name\":\"gadget\",\"quantity\":1,\"price\":50.00}",
+                        1, false),
+                row(DB_NAME, orderItemsTable,
+                        "{\"item_id\":3,\"order_id\":2,\"product_name\":\"doohickey\",\"quantity\":3,\"price\":25.00}",
+                        1, true)
+        ).returns(TypeInformation.of(DefaultStarRocksRowData.class));
+
+        partition0.union(partition1)
+                .keyBy(DefaultStarRocksRowData::getSourcePartition)
+                .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
+                .setParallelism(2);
+
+        env.execute("testEndToEndMultiPartition");
+
+        verifyResult(
+                Arrays.asList(
+                        Arrays.asList(1L, 100L, new BigDecimal("99.99"), "created"),
+                        Arrays.asList(2L, 101L, new BigDecimal("25.00"), "created")),
+                scanTable(DB_CONNECTION, DB_NAME, ordersTable));
+
+        verifyResult(
+                Arrays.asList(
+                        Arrays.asList(1L, 1L, "widget",    2, new BigDecimal("49.99")),
+                        Arrays.asList(2L, 1L, "gadget",    1, new BigDecimal("50.00")),
+                        Arrays.asList(3L, 2L, "doohickey", 3, new BigDecimal("25.00"))),
+                scanTable(DB_CONNECTION, DB_NAME, orderItemsTable));
+    }
+
+    /**
+     * Transaction consistency timing test — the core correctness guarantee.
+     *
+     * <p>Verifies that data is NOT visible in StarRocks before the txnEnd marker
+     * arrives, even after the flush interval has elapsed multiple times.
+     * Only after txnEnd is received should the data become visible.
+     *
+     * <p>Timeline:
+     * <pre>
+     *   t=0              source emits data rows (no txnEnd)
+     *   t=2×interval     assert tables EMPTY  ← flush timer fired but no commit
+     *   t=2×interval     emit txnEnd          ← event-driven commit triggered
+     *   t=2×interval+Δ   assert tables have data (Δ ≈ network round-trip)
+     * </pre>
+     *
+     * <p>This test validates the event-driven {@code setCommitAllowed} path in
+     * {@code DefaultStreamLoadManager}: on txnEnd the task thread immediately calls
+     * {@code switchChunkForCommit()} on all regions and signals the manager thread,
+     * which then drives flush → prepare → commit without waiting for the age timer.
+     */
+    @Test
+    public void testNoFlushBeforeTxnEnd() throws Exception {
+        String ordersTable = createOrdersTable();
+        String orderItemsTable = createOrderItemsTable();
+
+        TxnEndControlledSource.reset(DB_NAME, ordersTable, orderItemsTable);
+
+        StreamExecutionEnvironment env = buildEnv(1);
+        env.addSource(new TxnEndControlledSource())
+                .setParallelism(1)
+                .returns(TypeInformation.of(DefaultStarRocksRowData.class))
+                .keyBy(DefaultStarRocksRowData::getSourcePartition)
+                .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
+                .setParallelism(1);
+
+        Thread jobThread = new Thread(() -> {
+            try {
+                env.execute("testNoFlushBeforeTxnEnd");
+            } catch (Exception e) {
+                LOG.warn("Job thread finished (may be expected on cancel)", e);
+            }
+        }, "flink-job-thread");
+        jobThread.start();
+
+        try {
+            // Wait 2× flush interval — the age-based timer fires but commitAllowed=false
+            Thread.sleep(2L * FLUSH_INTERVAL_MS);
+
+            assertEquals("orders must be empty before txnEnd",
+                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
+            assertEquals("order_items must be empty before txnEnd",
+                    0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+
+            LOG.info("Confirmed: no data visible before txnEnd. Sending txnEnd signal.");
+            TxnEndControlledSource.SEND_TXN_END_LATCH.countDown();
+
+            assertTrue("txnEnd row should be emitted within 10 s",
+                    TxnEndControlledSource.TXN_END_EMITTED_LATCH.await(10, TimeUnit.SECONDS));
+
+            // Event-driven commit: switchChunk already done on task thread;
+            // manager thread only needs one HTTP round-trip to flush + prepare + commit.
+            Thread.sleep(COMMIT_PROPAGATION_MS);
+
+            List<List<Object>> ordersAfter = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            List<List<Object>> itemsAfter  = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable);
+
+            assertEquals("orders must have 1 row after txnEnd", 1, ordersAfter.size());
+            assertEquals("order_items must have 2 rows after txnEnd", 2, itemsAfter.size());
+
+            verifyResult(
+                    Arrays.asList(Arrays.asList(1L, 100L, new BigDecimal("99.99"), "created")),
+                    ordersAfter);
+            verifyResult(
+                    Arrays.asList(
+                            Arrays.asList(1L, 1L, "widget", 2, new BigDecimal("49.99")),
+                            Arrays.asList(2L, 1L, "gadget", 1, new BigDecimal("50.00"))),
+                    itemsAfter);
+
+            LOG.info("Confirmed: data visible after txnEnd. Transaction consistency verified.");
+        } finally {
+            jobThread.interrupt();
+            jobThread.join(5_000);
+        }
+    }
+
+    /**
+     * Consecutive transaction isolation test.
+     *
+     * <p>Verifies that after txn-1 commits, txn-2's data is NOT visible until
+     * txn-2's own txnEnd arrives. This exercises the "re-arm" logic: after a
+     * commit cycle completes, {@code commitInFlight} is reset to {@code false}
+     * so the next source transaction is blocked until its own txnEnd marker.
+     *
+     * <p>Timeline:
+     * <pre>
+     *   t=0              txn-1 data emitted
+     *   t=2×interval     assert EMPTY  (no txnEnd yet)
+     *   t=2×interval     emit txn-1 txnEnd → commit
+     *   t=2×interval+Δ   assert 1 row  (txn-1 visible, txn-2 not started)
+     *   t=...            txn-2 data emitted (commitInFlight re-armed to false)
+     *   t=...+2×interval assert still 1 row (txn-2 data buffered, no txnEnd)
+     *   t=...            emit txn-2 txnEnd → commit
+     *   t=...+Δ          assert 2 rows (both txns visible)
+     * </pre>
+     */
+    @Test
+    public void testMultipleConsecutiveTransactions() throws Exception {
+        String ordersTable = createOrdersTable();
+        String orderItemsTable = createOrderItemsTable();
+
+        MultiTxnControlledSource.reset(DB_NAME, ordersTable, orderItemsTable);
+
+        StreamExecutionEnvironment env = buildEnv(1);
+        env.addSource(new MultiTxnControlledSource())
+                .setParallelism(1)
+                .returns(TypeInformation.of(DefaultStarRocksRowData.class))
+                .keyBy(DefaultStarRocksRowData::getSourcePartition)
+                .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
+                .setParallelism(1);
+
+        Thread jobThread = new Thread(() -> {
+            try {
+                env.execute("testMultipleConsecutiveTransactions");
+            } catch (Exception e) {
+                LOG.warn("Job thread finished (may be expected on cancel)", e);
+            }
+        }, "flink-job-thread");
+        jobThread.start();
+
+        try {
+            // ---- Phase 1: txn-1 data emitted, no txnEnd yet ----
+            Thread.sleep(2L * FLUSH_INTERVAL_MS);
+            assertEquals("orders empty before txn-1 txnEnd",
+                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
+
+            // Allow txn-1 to commit
+            MultiTxnControlledSource.TXN1_END_LATCH.countDown();
+            assertTrue("txn-1 end emitted within 10 s",
+                    MultiTxnControlledSource.TXN1_END_EMITTED_LATCH.await(10, TimeUnit.SECONDS));
+            Thread.sleep(COMMIT_PROPAGATION_MS);
+
+            // txn-1 data must now be visible
+            List<List<Object>> afterTxn1 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            assertEquals("orders must have 1 row after txn-1", 1, afterTxn1.size());
+            verifyResult(
+                    Arrays.asList(Arrays.asList(1L, 100L, new BigDecimal("10.00"), "created")),
+                    afterTxn1);
+
+            // ---- Phase 2: txn-2 data emitted, no txnEnd yet ----
+            // commitInFlight was reset to false after txn-1 commit
+            Thread.sleep(2L * FLUSH_INTERVAL_MS);
+            List<List<Object>> midTxn2 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            assertEquals("orders must still have only 1 row (txn-2 not committed yet)",
+                    1, midTxn2.size());
+
+            // Allow txn-2 to commit
+            MultiTxnControlledSource.TXN2_END_LATCH.countDown();
+            assertTrue("txn-2 end emitted within 10 s",
+                    MultiTxnControlledSource.TXN2_END_EMITTED_LATCH.await(10, TimeUnit.SECONDS));
+            Thread.sleep(COMMIT_PROPAGATION_MS);
+
+            // Both txn-1 and txn-2 data must be visible
+            List<List<Object>> afterTxn2 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            assertEquals("orders must have 2 rows after txn-2", 2, afterTxn2.size());
+            verifyResult(
+                    Arrays.asList(
+                            Arrays.asList(1L, 100L, new BigDecimal("10.00"), "created"),
+                            Arrays.asList(2L, 101L, new BigDecimal("20.00"), "created")),
+                    afterTxn2);
+
+            LOG.info("Confirmed: consecutive transaction isolation verified.");
+        } finally {
+            jobThread.interrupt();
+            jobThread.join(5_000);
+        }
+    }
+
+    /**
+     * Boundary test: a txnEnd row with no preceding data rows must not cause
+     * an error and must leave the tables empty.
+     */
+    @Test
+    public void testEmptyTransaction() throws Exception {
+        String ordersTable = createOrdersTable();
+        String orderItemsTable = createOrderItemsTable();
+
+        StreamExecutionEnvironment env = buildEnv(1);
+        // Only a txnEnd row, no actual data
+        env.fromElements(
+                row(DB_NAME, ordersTable, null, 0, true)
+        ).returns(TypeInformation.of(DefaultStarRocksRowData.class))
+                .keyBy(DefaultStarRocksRowData::getSourcePartition)
+                .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS));
+
+        env.execute("testEmptyTransaction");
+
+        assertEquals("orders must be empty after empty transaction",
+                0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
+        assertEquals("order_items must be empty after empty transaction",
+                0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+    }
+
+    // -------------------------------------------------------------------------
+    // Controlled source functions (use static fields to avoid ClosureCleaner)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Source for {@link #testNoFlushBeforeTxnEnd}.
+     *
+     * <p>Phase 1: emits data rows without txnEnd (sink must not commit).
+     * Phase 2: waits for {@link #SEND_TXN_END_LATCH}, then emits the txnEnd marker.
+     */
+    private static class TxnEndControlledSource
+            extends RichParallelSourceFunction<DefaultStarRocksRowData> {
+
+        private static final long serialVersionUID = 1L;
+
+        static volatile CountDownLatch SEND_TXN_END_LATCH;
+        static volatile CountDownLatch TXN_END_EMITTED_LATCH;
+        static volatile String DB;
+        static volatile String ORDERS_TABLE;
+        static volatile String ORDER_ITEMS_TABLE;
+
+        static void reset(String db, String ordersTable, String orderItemsTable) {
+            DB = db;
+            ORDERS_TABLE = ordersTable;
+            ORDER_ITEMS_TABLE = orderItemsTable;
+            SEND_TXN_END_LATCH    = new CountDownLatch(1);
+            TXN_END_EMITTED_LATCH = new CountDownLatch(1);
+        }
+
+        @Override
+        public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            // Phase 1: data rows, no txnEnd
+            ctx.collect(row(DB, ORDERS_TABLE,
+                    "{\"order_id\":1,\"customer_id\":100,\"total_amount\":99.99,\"order_status\":\"created\"}",
+                    0, false));
+            ctx.collect(row(DB, ORDER_ITEMS_TABLE,
+                    "{\"item_id\":1,\"order_id\":1,\"product_name\":\"widget\",\"quantity\":2,\"price\":49.99}",
+                    0, false));
+            ctx.collect(row(DB, ORDER_ITEMS_TABLE,
+                    "{\"item_id\":2,\"order_id\":1,\"product_name\":\"gadget\",\"quantity\":1,\"price\":50.00}",
+                    0, false));
+
+            SEND_TXN_END_LATCH.await();
+
+            // Phase 2: txnEnd marker (null row = no data, just signal end-of-transaction)
+            ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));
+            TXN_END_EMITTED_LATCH.countDown();
+        }
+
+        @Override
+        public void cancel() {
+            CountDownLatch l = SEND_TXN_END_LATCH;
+            if (l != null) l.countDown();
+        }
+    }
+
+    /**
+     * Source for {@link #testMultipleConsecutiveTransactions}.
+     *
+     * <p>Emits two back-to-back transactions, each gated by its own latch pair so
+     * the test thread can control exactly when each txnEnd is delivered.
+     */
+    private static class MultiTxnControlledSource
+            extends RichParallelSourceFunction<DefaultStarRocksRowData> {
+
+        private static final long serialVersionUID = 1L;
+
+        static volatile CountDownLatch TXN1_END_LATCH;
+        static volatile CountDownLatch TXN1_END_EMITTED_LATCH;
+        static volatile CountDownLatch TXN2_END_LATCH;
+        static volatile CountDownLatch TXN2_END_EMITTED_LATCH;
+        static volatile String DB;
+        static volatile String ORDERS_TABLE;
+
+        static void reset(String db, String ordersTable, String orderItemsTable) {
+            DB = db;
+            ORDERS_TABLE = ordersTable;
+            TXN1_END_LATCH          = new CountDownLatch(1);
+            TXN1_END_EMITTED_LATCH  = new CountDownLatch(1);
+            TXN2_END_LATCH          = new CountDownLatch(1);
+            TXN2_END_EMITTED_LATCH  = new CountDownLatch(1);
+        }
+
+        @Override
+        public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            // txn-1 data
+            ctx.collect(row(DB, ORDERS_TABLE,
+                    "{\"order_id\":1,\"customer_id\":100,\"total_amount\":10.00,\"order_status\":\"created\"}",
+                    0, false));
+
+            TXN1_END_LATCH.await();
+            ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));  // txn-1 end
+            TXN1_END_EMITTED_LATCH.countDown();
+
+            // txn-2 data (commitInFlight re-armed to false after txn-1 commit)
+            ctx.collect(row(DB, ORDERS_TABLE,
+                    "{\"order_id\":2,\"customer_id\":101,\"total_amount\":20.00,\"order_status\":\"created\"}",
+                    0, false));
+
+            TXN2_END_LATCH.await();
+            ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));  // txn-2 end
+            TXN2_END_EMITTED_LATCH.countDown();
+        }
+
+        @Override
+        public void cancel() {
+            CountDownLatch l1 = TXN1_END_LATCH;
+            CountDownLatch l2 = TXN2_END_LATCH;
+            if (l1 != null) l1.countDown();
+            if (l2 != null) l2.countDown();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared builder helpers
+    // -------------------------------------------------------------------------
+
+    private StreamExecutionEnvironment buildEnv(int parallelism) {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
+        env.setParallelism(parallelism);
+        env.enableCheckpointing(5_000);
+        return env;
+    }
+
+    private SinkFunction<DefaultStarRocksRowData> buildSink(
+            String ordersTable, String orderItemsTable, int flushIntervalMs) {
+        StarRocksSinkOptions options = StarRocksSinkOptions.builder()
+                .withProperty("jdbc-url", getJdbcUrl())
+                .withProperty("load-url", getHttpUrls())
+                .withProperty("database-name", "*")
+                .withProperty("table-name", "*")
+                .withProperty("username", USERNAME)
+                .withProperty("password", PASSWORD)
+                .withProperty("sink.version", "V2")
+                .withProperty("sink.semantic", "at-least-once")
+                .withProperty("sink.transaction.multi-table.enabled", "true")
+                .withProperty("sink.buffer-flush.interval-ms", String.valueOf(flushIntervalMs))
+                .withProperty("sink.properties.format", "json")
+                .withProperty("sink.properties.strip_outer_array", "true")
+                .build();
+
+        options.addTableProperties(StreamLoadTableProperties.builder()
+                .database(DB_NAME)
+                .table(orderItemsTable)
+                .addProperty("format", "json")
+                .addProperty("strip_outer_array", "true")
+                .addProperty("ignore_json_size", "true")
+                .build());
+
+        return SinkFunctionFactory.createSinkFunction(options);
+    }
+
+    /** Builds a {@link DefaultStarRocksRowData}. {@code json} may be {@code null} for txnEnd-only rows. */
+    private static DefaultStarRocksRowData row(String db, String table, String json,
+                                               int partition, boolean txnEnd) {
+        DefaultStarRocksRowData r = new DefaultStarRocksRowData(null, db, table, json);
+        r.setSourcePartition(partition);
+        r.setTransactionEnd(txnEnd);
+        return r;
+    }
+}

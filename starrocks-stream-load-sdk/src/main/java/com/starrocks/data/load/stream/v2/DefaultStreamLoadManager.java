@@ -101,6 +101,14 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     private volatile boolean allRegionsCommitted;
     private long flushTimeoutMs = 660000L; // default stream load timeout is 600s, 1.1x for flush
 
+    /**
+     * In multi-table transaction mode: set to true when the task thread receives a
+     * txnEnd marker and has already executed switchChunk on all regions.  The manager
+     * thread picks this up and drives the flush → prepare → commit cycle.
+     * Reset to false after the commit cycle completes.
+     */
+    private volatile boolean commitInFlight = false;
+
     private final Lock lock = new ReentrantLock();
     private final Condition writable = lock.newCondition();
     private final Condition flushable = lock.newCondition();
@@ -214,7 +222,54 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             }
                         }
                         LockSupport.unpark(current);
+                    } else if (commitInFlight) {
+                        // ---------------------------------------------------------------
+                        // Multi-table event-driven commit — Phase 2 (manager thread)
+                        //
+                        // The task thread has already called switchChunkForCommit() on all
+                        // regions, moving the active chunks to the inactive queue.
+                        // We must NOT call flush() here because that would switchChunk again
+                        // and pull in data from the *next* source transaction.
+                        //
+                        // Instead:
+                        //   a) For each region that still has inactive chunks pending load,
+                        //      trigger the HTTP load (streamLoad) if not already in progress.
+                        //   b) Commit each region (polls until the async load + prepare +
+                        //      commit cycle completes).
+                        //   c) Reset commitInFlight so the next txnEnd can be processed.
+                        // ---------------------------------------------------------------
+                        LOG.info("[MultiTxn] manager: commitInFlight=true, processing {} regions", flushQ.size());
+
+                        // (a) Trigger load for regions that have inactive chunks but are ACTIVE
+                        //     (i.e. switchChunkForCommit moved data but no load started yet)
+                        for (TransactionTableRegion region : flushQ) {
+                            boolean triggered = region.triggerLoadIfNeeded();
+                            LOG.info("[MultiTxn] triggerLoadIfNeeded region={}, cacheBytes={}, triggered={}",
+                                    region.getUniqueKey(), region.getCacheBytes(), triggered);
+                        }
+
+                        // (b) Commit each region (poll until success)
+                        int committedCount = 0;
+                        for (TransactionTableRegion region : flushQ) {
+                            boolean success = region.commit();
+                            LOG.info("[MultiTxn] commit region={}, label={}, state={}, success={}",
+                                    region.getUniqueKey(), region.getLabel(), region.getStateForLog(), success);
+                            if (success) {
+                                region.resetAge();
+                                committedCount++;
+                            }
+                        }
+
+                        if (committedCount == flushQ.size()) {
+                            // (c) All regions committed — reset commitInFlight
+                            commitInFlight = false;
+                            LOG.info("[MultiTxn] All {} regions committed; commitInFlight=false", committedCount);
+                        } else {
+                            LOG.info("[MultiTxn] {}/{} regions committed; will retry next scan",
+                                    committedCount, flushQ.size());
+                        }
                     } else {
+                        // Normal timer-driven path (non-multi-table, or multi-table between commits)
                         for (TransactionTableRegion region : flushQ) {
                             region.getAndIncrementAge();
                             if (flushAndCommitStrategy.shouldCommit(region)) {
@@ -246,6 +301,49 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
             streamLoader.start(properties, this);
         }
+    }
+
+    @Override
+    public void setCommitAllowed(boolean allowed) {
+        if (!flushAndCommitStrategy.isMultiTableTransactionEnabled()) {
+            // Non-multi-table mode: no-op (commit is always driven by timer)
+            return;
+        }
+        if (!allowed) {
+            // Called after a non-txnEnd data row: nothing to do in event-driven mode.
+            // The commitInFlight guard already prevents premature commits.
+            LOG.debug("[MultiTxn] setCommitAllowed(false) ignored in event-driven mode");
+            return;
+        }
+
+        // allowed=true means the task thread just received a txnEnd marker.
+        // Per the design doc (§6.1 Phase 1):
+        //   1. switchChunk all regions on the task thread (~1ms, no race with write())
+        //   2. Set commitInFlight=true to prevent new commit triggers
+        //   3. Wake up the manager thread
+        if (commitInFlight) {
+            LOG.warn("[MultiTxn] setCommitAllowed(true) called while commitInFlight=true; ignoring duplicate txnEnd");
+            return;
+        }
+
+        LOG.info("[MultiTxn] txnEnd received — switchChunk all regions and signal manager. " +
+                "currentCacheBytes={}, regions={}", currentCacheBytes.get(), regions.keySet());
+
+        // Phase 1: switchChunk on the task thread (single-threaded, no race with write())
+        for (TransactionTableRegion region : flushQ) {
+            region.switchChunkForCommit();
+        }
+
+        commitInFlight = true;
+
+        // Wake up the manager thread to start Phase 2 (flush → prepare → commit)
+        lock.lock();
+        try {
+            flushable.signal();
+        } finally {
+            lock.unlock();
+        }
+        LOG.info("[MultiTxn] commitInFlight=true, manager thread signaled");
     }
 
     public void setStreamLoadListener(StreamLoadListener streamLoadListener) {

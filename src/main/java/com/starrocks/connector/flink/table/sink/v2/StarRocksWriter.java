@@ -140,7 +140,16 @@ public class StarRocksWriter<InputT>
         if (rowData == null) {
             return;
         }
+        if (rowData.getRow() == null) {
+            // A null-row record is a pure control signal (e.g. transaction-end marker).
+            // Propagate the txnEnd flag without writing any data.
+            if (rowData.isTransactionEnd()) {
+                sinkManager.setCommitAllowed(true);
+            }
+            return;
+        }
         sinkManager.write(rowData.getUniqueKey(), rowData.getDatabase(), rowData.getTable(), rowData.getRow());
+        sinkManager.setCommitAllowed(rowData.isTransactionEnd());
         totalReceivedRows += 1;
         if (totalReceivedRows % 100 == 1) {
             LOG.debug("Received raw record: {}", element);

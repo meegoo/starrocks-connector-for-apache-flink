@@ -139,11 +139,23 @@ public class StarRocksDynamicSinkFunctionV2<T> extends StarRocksDynamicSinkFunct
                 if (Strings.isNullOrEmpty(data.getDatabase())
                         || Strings.isNullOrEmpty(data.getTable())
                         || data.getRow() == null) {
-                    log.warn(String.format("json row data not fulfilled. {database: %s, table: %s, dataRows: %s}",
-                            data.getDatabase(), data.getTable(), data.getRow() == null ? "null" : "Redacted"));
+                    // A null-row record is a pure control signal (e.g. transaction-end marker).
+                    // Still propagate the txnEnd flag so the sink manager can update its
+                    // commit-allowed state even when there is no actual data to write.
+                    if (data.isTransactionEnd()) {
+                        log.info("[MultiTxn] invoke: control-only txnEnd row, db={}, table={}", data.getDatabase(), data.getTable());
+                        sinkManager.setCommitAllowed(true);
+                    } else {
+                        log.warn("[MultiTxn] invoke: skipping row with null/empty fields, db={}, table={}, txnEnd={}",
+                                data.getDatabase(), data.getTable(), data.isTransactionEnd());
+                    }
                     return;
                 }
+                log.info("[MultiTxn] invoke: write row db={}, table={}, txnEnd={}, rowLen={}",
+                        data.getDatabase(), data.getTable(), data.isTransactionEnd(),
+                        data.getRow() == null ? 0 : data.getRow().length());
                 sinkManager.write(data.getUniqueKey(), data.getDatabase(), data.getTable(), data.getRow());
+                sinkManager.setCommitAllowed(data.isTransactionEnd());
                 return;
             }
             // raw data sink

@@ -183,6 +183,11 @@ public class TransactionTableRegion implements TableRegion {
         return cacheBytes.get();
     }
 
+    /** Returns the current state as a string for logging purposes. */
+    public String getStateForLog() {
+        return state.get().name();
+    }
+
     @Override
     public void resetAge() {
         age.set(0);
@@ -225,6 +230,51 @@ public class TransactionTableRegion implements TableRegion {
         }
         inactiveChunks.add(activeChunk);
         activeChunk = new Chunk(properties.getDataFormat(), chunkIdGenerator.getAndIncrement());
+    }
+
+    /**
+     * Called by the task thread when a txnEnd marker is received (multi-table mode).
+     *
+     * <p>Moves the active chunk to the inactive queue so the manager thread can
+     * flush it.  This runs on the task thread which is single-threaded in Flink,
+     * so there is no concurrent {@link #write(byte[])} call.
+     */
+    public void switchChunkForCommit() {
+        // Acquire the ctl spinlock to be safe (write0 also holds it during switchChunk)
+        for (;;) {
+            if (ctl.compareAndSet(false, true)) {
+                switchChunk();
+                ctl.set(false);
+                LOG.info("[MultiTxn] switchChunkForCommit: db={}, table={}, inactiveChunks={}",
+                        database, table, inactiveChunks.size());
+                return;
+            }
+        }
+    }
+
+    /**
+     * Called by the manager thread during the commitInFlight phase.
+     *
+     * <p>If the region has inactive chunks that have not yet been sent (state is ACTIVE),
+     * transitions to FLUSHING and starts the HTTP load.  This is different from
+     * {@link #flush(FlushReason)} in that it does NOT call {@link #switchChunk()} —
+     * the task thread has already done that via {@link #switchChunkForCommit()}.
+     *
+     * @return {@code true} if a load was triggered, {@code false} otherwise
+     */
+    public boolean triggerLoadIfNeeded() {
+        if (inactiveChunks.isEmpty()) {
+            // No data to load (region had no data when txnEnd arrived)
+            return false;
+        }
+        if (state.compareAndSet(State.ACTIVE, State.FLUSHING)) {
+            LOG.info("[MultiTxn] triggerLoadIfNeeded: db={}, table={}, label={}, inactiveChunks={}, cacheBytes={}",
+                    database, table, label, inactiveChunks.size(), cacheBytes.get());
+            streamLoad(0);
+            return true;
+        }
+        // Already FLUSHING or COMMITTING — load is in progress
+        return false;
     }
 
     protected int write0(byte[] row) {
