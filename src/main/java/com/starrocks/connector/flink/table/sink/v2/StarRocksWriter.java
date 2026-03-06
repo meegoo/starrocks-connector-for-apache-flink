@@ -140,16 +140,19 @@ public class StarRocksWriter<InputT>
         if (rowData == null) {
             return;
         }
+        int partition = rowData.getSourcePartition();
         if (rowData.getRow() == null) {
-            // A null-row record is a pure control signal (e.g. transaction-end marker).
-            // Propagate the txnEnd flag without writing any data.
             if (rowData.isTransactionEnd()) {
-                sinkManager.setCommitAllowed(true);
+                sinkManager.setCommitAllowed(partition, true);
             }
             return;
         }
-        sinkManager.write(rowData.getUniqueKey(), rowData.getDatabase(), rowData.getTable(), rowData.getRow());
-        sinkManager.setCommitAllowed(rowData.isTransactionEnd());
+        if (partition >= 0) {
+            sinkManager.write(partition, rowData.getDatabase(), rowData.getTable(), rowData.getRow());
+            sinkManager.setCommitAllowed(partition, rowData.isTransactionEnd());
+        } else {
+            sinkManager.write(rowData.getUniqueKey(), rowData.getDatabase(), rowData.getTable(), rowData.getRow());
+        }
         totalReceivedRows += 1;
         if (totalReceivedRows % 100 == 1) {
             LOG.debug("Received raw record: {}", element);

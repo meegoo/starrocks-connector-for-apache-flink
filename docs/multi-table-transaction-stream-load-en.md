@@ -311,59 +311,73 @@ TransactionAssembler (KeyedProcessFunction)
   |  Every row carries sourcePartition
   |
   v
-keyBy(sourcePartition) ———— Ensures same-partition rows go to the same sink subtask (ordering)
+keyBy(sourcePartition) ———— Ensures same-partition rows go to the same sink subtask
   |
   v
 StarRocksDynamicSinkFunctionV2 (via SinkFunctionFactory.createSinkFunction)
   |
   |  +——————————— StreamLoadManagerV2 (multi-table txn mode) ———————————+
   |  |                                                                   |
-  |  |  write(row)                                                       |
-  |  |    -> ensureSharedTxnBegun (first write: begin shared txn)        |
-  |  |    -> region.write (write to active chunk)                        |
-  |  |    -> setCommitAllowed(row.isTransactionEnd())                    |
-  |  |        | true + timer ready + !commitInFlight?                    |
-  |  |        -> triggerCommitFromTaskThread()                           |
-  |  |            switchChunk all regions (~1ms, task thread, no race)   |
-  |  |            commitInFlight = true                                  |
-  |  |            signal manager thread                                  |
+  |  |  Per-partition, per-table regions:                                 |
+  |  |    Region(P0, orders), Region(P0, order_items)                    |
+  |  |    Region(P2, orders), Region(P2, order_items)                    |
   |  |                                                                   |
-  |  |  Manager thread:                                                  |
-  |  |    commitInFlight=true:  wait for loads -> prepare -> commit      |
-  |  |    commitInFlight=false: periodic buffer flush (txn/load API)     |
+  |  |  write(partition, db, table, row)                                 |
+  |  |    -> routes to Region(partition, db, table)                      |
+  |  |    -> PartitionCommitTracker.onWrite(partition)                   |
+  |  |                                                                   |
+  |  |  setCommitAllowed(partition, txnEnd=true)                         |
+  |  |    -> PartitionCommitTracker.onTxnEnd(partition)                  |
+  |  |    -> if interval elapsed: switchChunk only this partition's       |
+  |  |       regions, mark partition SWITCHED                            |
+  |  |    -> if all partitions SWITCHED: signal manager thread           |
+  |  |                                                                   |
+  |  |  Manager thread (commitInFlight=true):                            |
+  |  |    -> triggerLoad per region (HTTP /api/transaction/load)         |
+  |  |    -> wait all loads complete                                     |
+  |  |    -> per-region prepare + commit                                 |
+  |  |    -> reset tracker for next cycle                                |
   |  +———————————————————————————————————————————————————————————————————+
   |
   v
-StarRocks (test.orders + test.order_items, atomically visible)
+StarRocks (test.orders + test.order_items)
 ```
 
 ## 6. How It Works
 
-### 6.1 Two-Phase Async Commit
+### 6.1 Per-Partition Commit Tracking
 
-**Phase 1 (task thread, ~1ms, non-blocking):**
+Each sink subtask may receive data from multiple source partitions (via `keyBy(sourcePartition)`).
+The `PartitionCommitTracker` tracks each partition independently:
 
-When a row with `transactionEnd=true` is written and `sink.buffer-flush.interval-ms` has elapsed since the last commit:
-1. Execute switchChunk on all regions (move active chunks to inactive queue)
-2. Set `commitInFlight=true` to prevent new commit triggers
-3. Wake up the manager thread
-4. Return immediately — the task thread continues processing new rows
+1. **onWrite(partition)**: registers the partition as active
+2. **onTxnEnd(partition)**: marks the partition as having completed its current source transaction
+3. **trySwitchAndCommit()**: when the flush interval has elapsed, switches regions for
+   all partitions that have reached txnEnd. Only when **all active partitions** have been
+   switched does it trigger the commit phase.
+
+**Phase 1 (task thread, per-partition switchChunk):**
+
+When a partition's txnEnd arrives and the flush interval has elapsed:
+1. SwitchChunk only **that partition's** regions (not other partitions')
+2. Mark the partition as SWITCHED in the tracker
+3. If all active partitions are SWITCHED: set `commitInFlight=true` and wake the manager thread
 
 **Phase 2 (manager thread, async):**
 
-1. Wait for all HTTP loads of inactive chunks to complete
-2. Call `/api/transaction/prepare`
-3. Call `/api/transaction/commit` (atomically commits all tables)
-4. Reset labels and transaction state; set `commitInFlight=false`
+1. Trigger HTTP loads for regions with inactive chunks
+2. Wait for all loads to complete
+3. Per-region prepare + commit
+4. Reset tracker; set `commitInFlight=false`
 
 ### 6.2 Safety Guarantees
 
 | Guarantee | Mechanism |
 |---|---|
-| switchChunk does not split source transactions | switchChunk runs on the task thread; Flink's single-threaded model ensures no concurrent processElement |
-| Commit never includes partial source transactions | Commit is only triggered when `transactionEnd=true` (last row of a source transaction) |
-| Multi-table atomic commit | All tables share one StarRocks transaction label; unified prepare + commit |
-| Within-partition ordering | `keyBy(sourcePartition)` ensures data from the same partition is routed to the same sink subtask |
+| switchChunk does not split source transactions | switchChunk is per-partition; only triggered when that partition has txnEnd |
+| Commit never includes partial source transactions | Commit waits until ALL active partitions reach txnEnd |
+| Multi-partition safety | Per-partition regions ensure one partition's switchChunk does not affect another's data |
+| Within-partition ordering | `keyBy(sourcePartition)` ensures same-partition data reaches the same sink subtask |
 | Task thread is non-blocking | switchChunk takes ~1ms; HTTP wait is handled asynchronously by the manager thread |
 | Periodic flush continues working | Manager thread buffer-management flushes run normally when `!commitInFlight` |
 

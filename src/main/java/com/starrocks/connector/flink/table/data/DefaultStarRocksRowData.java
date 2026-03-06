@@ -96,6 +96,7 @@ public class DefaultStarRocksRowData implements StarRocksRowData {
         this.sourcePartition = sourcePartition;
     }
 
+    @Override
     public int getSourcePartition() {
         return sourcePartition;
     }

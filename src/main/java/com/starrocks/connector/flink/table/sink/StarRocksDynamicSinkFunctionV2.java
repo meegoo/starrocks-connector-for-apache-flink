@@ -136,26 +136,22 @@ public class StarRocksDynamicSinkFunctionV2<T> extends StarRocksDynamicSinkFunct
                 return;
             } else if (value instanceof StarRocksRowData) {
                 StarRocksRowData data = (StarRocksRowData) value;
+                int partition = data.getSourcePartition();
                 if (Strings.isNullOrEmpty(data.getDatabase())
                         || Strings.isNullOrEmpty(data.getTable())
                         || data.getRow() == null) {
-                    // A null-row record is a pure control signal (e.g. transaction-end marker).
-                    // Still propagate the txnEnd flag so the sink manager can update its
-                    // commit-allowed state even when there is no actual data to write.
                     if (data.isTransactionEnd()) {
-                        log.info("[MultiTxn] invoke: control-only txnEnd row, db={}, table={}", data.getDatabase(), data.getTable());
-                        sinkManager.setCommitAllowed(true);
-                    } else {
-                        log.warn("[MultiTxn] invoke: skipping row with null/empty fields, db={}, table={}, txnEnd={}",
-                                data.getDatabase(), data.getTable(), data.isTransactionEnd());
+                        log.debug("[MultiTxn] invoke: control-only txnEnd row, partition={}", partition);
+                        sinkManager.setCommitAllowed(partition, true);
                     }
                     return;
                 }
-                log.info("[MultiTxn] invoke: write row db={}, table={}, txnEnd={}, rowLen={}",
-                        data.getDatabase(), data.getTable(), data.isTransactionEnd(),
-                        data.getRow() == null ? 0 : data.getRow().length());
-                sinkManager.write(data.getUniqueKey(), data.getDatabase(), data.getTable(), data.getRow());
-                sinkManager.setCommitAllowed(data.isTransactionEnd());
+                if (partition >= 0) {
+                    sinkManager.write(partition, data.getDatabase(), data.getTable(), data.getRow());
+                    sinkManager.setCommitAllowed(partition, data.isTransactionEnd());
+                } else {
+                    sinkManager.write(data.getUniqueKey(), data.getDatabase(), data.getTable(), data.getRow());
+                }
                 return;
             }
             // raw data sink

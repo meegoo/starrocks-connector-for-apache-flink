@@ -40,7 +40,8 @@ public interface StreamLoader {
      * @return true if the transaction was successfully begun
      */
     default boolean beginTransaction(String label, String database, String table) {
-        return true;
+        throw new UnsupportedOperationException(
+                "beginTransaction is not supported by this StreamLoader implementation");
     }
 
     Future<StreamLoadResponse> send(TableRegion region);

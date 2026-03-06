@@ -37,4 +37,13 @@ public interface StarRocksRowData {
         return false;
     }
 
+    /**
+     * Returns the source partition ID for this row.
+     * Used by multi-table transaction mode to track per-partition transaction
+     * boundaries. Returns {@code -1} when partition tracking is not applicable.
+     */
+    default int getSourcePartition() {
+        return -1;
+    }
+
 }

@@ -53,6 +53,23 @@ public interface StreamLoadManager {
 
     default void setCommitAllowed(boolean allowed) {}
 
+    /**
+     * Partition-aware variant for multi-table transaction mode.
+     * Signals that partition {@code partition} has reached a transaction boundary.
+     */
+    default void setCommitAllowed(int partition, boolean allowed) {
+        setCommitAllowed(allowed);
+    }
+
+    /**
+     * Partition-aware write for multi-table transaction mode.
+     * Routes data to a per-partition region so that switchChunk can be
+     * scoped to a single partition without affecting other partitions' data.
+     */
+    default void write(int partition, String database, String table, String... rows) {
+        write(null, database, table, rows);
+    }
+
     default Throwable getException() {
         return null;
     }

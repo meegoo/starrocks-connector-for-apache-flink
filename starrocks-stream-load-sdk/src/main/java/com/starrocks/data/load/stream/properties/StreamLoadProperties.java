@@ -417,6 +417,7 @@ public class StreamLoadProperties implements Serializable {
 
         public Builder enableMultiTableTransaction() {
             this.enableMultiTableTransaction = true;
+            this.enableTransaction = true;
             return this;
         }
 

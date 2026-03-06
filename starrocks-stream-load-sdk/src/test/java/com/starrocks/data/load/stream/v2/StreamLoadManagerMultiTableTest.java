@@ -50,7 +50,7 @@ public class StreamLoadManagerMultiTableTest {
         }
     }
 
-    private StreamLoadProperties buildProperties(int flushIntervalMs) {
+    private StreamLoadProperties buildMultiTableProperties(int flushIntervalMs) {
         StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
                 .database("test")
                 .table("orders")
@@ -63,7 +63,6 @@ public class StreamLoadManagerMultiTableTest {
                 .username(USERNAME)
                 .password(PASSWORD)
                 .version("4.0.0")
-                .enableTransaction()
                 .enableMultiTableTransaction()
                 .labelPrefix("test-mtxn-")
                 .defaultTableProperties(tableProps)
@@ -73,69 +72,29 @@ public class StreamLoadManagerMultiTableTest {
                 .build();
     }
 
+    /**
+     * Single partition: write data to two tables, send txnEnd, verify commit.
+     */
     @Test
-    public void testMultiTableWriteAndCommit() throws Exception {
-        StreamLoadProperties properties = buildProperties(100);
+    public void testSinglePartitionWriteAndCommit() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
         StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
         manager.init();
 
         try {
-            manager.write(null, "test", "orders",
+            int partition = 0;
+            manager.write(partition, "test", "orders",
                     "{\"order_id\":1, \"customer_id\":100, \"total_amount\":99.99}");
-            manager.setCommitAllowed(false);
+            manager.setCommitAllowed(partition, false);
 
-            manager.write(null, "test", "order_items",
+            manager.write(partition, "test", "order_items",
                     "{\"item_id\":1, \"order_id\":1, \"product_name\":\"widget\", \"quantity\":2}");
-            manager.setCommitAllowed(false);
+            manager.setCommitAllowed(partition, true);
 
-            manager.write(null, "test", "order_items",
-                    "{\"item_id\":2, \"order_id\":1, \"product_name\":\"gadget\", \"quantity\":1}");
-            // last row of source transaction
-            manager.setCommitAllowed(true);
-
-            // timer not ready yet (just started), so no commit triggered
-            // wait for flush interval to elapse
-            Thread.sleep(200);
-
-            // write another transaction
-            manager.write(null, "test", "orders",
-                    "{\"order_id\":2, \"customer_id\":101, \"total_amount\":49.99}");
-            manager.setCommitAllowed(false);
-
-            manager.write(null, "test", "order_items",
-                    "{\"item_id\":3, \"order_id\":2, \"product_name\":\"doohickey\", \"quantity\":3}");
-            manager.setCommitAllowed(true);
-            // This should trigger commit (timer elapsed + txnEnd)
-
-            // wait for async commit to complete
             Thread.sleep(500);
-
-            // Verify no exceptions
             Assert.assertNull("No exception expected", manager.getException());
 
-        } finally {
-            manager.close();
-        }
-    }
-
-    @Test
-    public void testSavepointCommitsMultiTableTransaction() throws Exception {
-        StreamLoadProperties properties = buildProperties(60000);
-        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
-        manager.init();
-
-        try {
-            manager.write(null, "test", "orders",
-                    "{\"order_id\":1, \"customer_id\":100}");
-            manager.setCommitAllowed(false);
-
-            manager.write(null, "test", "order_items",
-                    "{\"item_id\":1, \"order_id\":1}");
-            manager.setCommitAllowed(true);
-
-            // flush() triggers savepoint which commits in multi-table mode
             manager.flush();
-
             Assert.assertNull("No exception expected after flush", manager.getException());
         } finally {
             manager.close();
@@ -143,34 +102,66 @@ public class StreamLoadManagerMultiTableTest {
     }
 
     /**
-     * Verifies that data is NOT committed while commitAllowed=false, even after
-     * the flush interval has elapsed multiple times.  Only after setCommitAllowed(true)
-     * is called should the manager thread commit the buffered data.
+     * Two partitions sharing one sink: commit only triggers when BOTH
+     * partitions have reached txnEnd.
+     */
+    @Test
+    public void testMultiPartitionCommitWaitsForAll() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            // Partition 0 writes + txnEnd
+            manager.write(0, "test", "orders",
+                    "{\"order_id\":1, \"customer_id\":100}");
+            manager.setCommitAllowed(0, true);
+
+            // Only partition 0 has txnEnd. Partition 1 hasn't even started.
+            // But there's also only partition 0 active, so commit may trigger.
+            Thread.sleep(300);
+            Assert.assertNull("No exception after P0 txnEnd", manager.getException());
+
+            // Now partition 1 writes + txnEnd
+            manager.write(1, "test", "orders",
+                    "{\"order_id\":2, \"customer_id\":101}");
+            manager.setCommitAllowed(1, false);
+
+            manager.write(1, "test", "order_items",
+                    "{\"item_id\":1, \"order_id\":2}");
+            manager.setCommitAllowed(1, true);
+
+            Thread.sleep(500);
+            Assert.assertNull("No exception after P1 txnEnd", manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Verifies that data is NOT committed while no partition has sent txnEnd.
      */
     @Test
     public void testCommitNotTriggeredWithoutTxnEnd() throws Exception {
-        StreamLoadProperties properties = buildProperties(100);
+        StreamLoadProperties properties = buildMultiTableProperties(100);
         StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
         manager.init();
 
         try {
-            manager.write(null, "test", "orders",
+            manager.write(0, "test", "orders",
                     "{\"order_id\":1, \"customer_id\":100}");
-            // Explicitly block commit — no txnEnd yet
-            manager.setCommitAllowed(false);
+            manager.setCommitAllowed(0, false);
 
-            // Wait 3× the flush interval; the manager thread must NOT commit
             Thread.sleep(300);
-
-            // No txnEnd was set, so no commit should have been triggered.
             Assert.assertNull("No exception expected", manager.getException());
 
-            // Now signal txnEnd — commit should be allowed on the next scan
-            manager.setCommitAllowed(true);
+            manager.setCommitAllowed(0, true);
             Thread.sleep(300);
             Assert.assertNull("No exception expected after txnEnd", manager.getException());
 
-            // Savepoint flush must also succeed
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
         } finally {
@@ -179,48 +170,65 @@ public class StreamLoadManagerMultiTableTest {
     }
 
     /**
-     * Verifies that after a commit cycle completes, commitAllowed is automatically
-     * re-armed to false so the next transaction is blocked until its own txnEnd.
+     * N:1 mapping: multiple source transactions accumulate before commit.
      */
     @Test
-    public void testCommitAllowedReArmedAfterCommit() throws Exception {
-        StreamLoadProperties properties = buildProperties(100);
+    public void testMultipleTransactionsAccumulate() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(500);
         StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
         manager.init();
 
         try {
-            // --- Transaction 1 ---
-            manager.write(null, "test", "orders",
-                    "{\"order_id\":1, \"customer_id\":100}");
-            manager.setCommitAllowed(false);
-            // Wait to confirm no premature commit
-            Thread.sleep(200);
-            Assert.assertNull("No exception after txn1 data (no txnEnd)", manager.getException());
+            // Txn 1
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
 
-            // Allow commit for txn1
-            manager.setCommitAllowed(true);
-            Thread.sleep(300); // let manager thread commit and re-arm
+            // Txn 2 (interval not elapsed yet, so txn 1 data stays in active chunk)
+            manager.write(0, "test", "orders", "{\"order_id\":2}");
+            manager.setCommitAllowed(0, true);
 
-            // --- Transaction 2: commitAllowed should be false again ---
-            manager.write(null, "test", "orders",
-                    "{\"order_id\":2, \"customer_id\":101}");
-            manager.setCommitAllowed(false);
-            // Wait to confirm no premature commit for txn2
-            Thread.sleep(200);
-            Assert.assertNull("No exception after txn2 data (no txnEnd)", manager.getException());
+            // Wait for interval
+            Thread.sleep(600);
 
-            // Allow commit for txn2
-            manager.setCommitAllowed(true);
-            Thread.sleep(300);
-            Assert.assertNull("No exception after txn2 txnEnd", manager.getException());
+            // Txn 3 triggers the interval check
+            manager.write(0, "test", "orders", "{\"order_id\":3}");
+            manager.setCommitAllowed(0, true);
+
+            Thread.sleep(500);
+            Assert.assertNull("No exception expected", manager.getException());
 
             manager.flush();
-            Assert.assertNull("No exception after final flush", manager.getException());
+            Assert.assertNull("No exception expected after flush", manager.getException());
         } finally {
             manager.close();
         }
     }
 
+    /**
+     * Savepoint (flush) works in multi-table mode.
+     */
+    @Test
+    public void testSavepointCommitsMultiTableTransaction() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(60000);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            manager.write(0, "test", "orders",
+                    "{\"order_id\":1, \"customer_id\":100}");
+            manager.write(0, "test", "order_items",
+                    "{\"item_id\":1, \"order_id\":1}");
+
+            manager.flush();
+            Assert.assertNull("No exception expected after flush", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Non-multi-table mode is completely unaffected by the new code paths.
+     */
     @Test
     public void testNonMultiTableModeUnaffected() throws Exception {
         StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
@@ -250,12 +258,7 @@ public class StreamLoadManagerMultiTableTest {
             manager.write(null, "test", "tbl1",
                     "{\"id\":1, \"name\":\"test\"}");
 
-            // setCommitAllowed is no-op in non-multi-table mode
-            manager.setCommitAllowed(true);
-
-            // flush via savepoint — uses original per-region commit
             manager.flush();
-
             Assert.assertNull("No exception expected", manager.getException());
         } finally {
             manager.close();

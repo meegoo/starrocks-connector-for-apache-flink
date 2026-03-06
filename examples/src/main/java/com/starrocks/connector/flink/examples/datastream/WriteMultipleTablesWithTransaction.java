@@ -54,18 +54,20 @@ import java.util.List;
  * Kafka Source
  *   → keyBy(partition)
  *   → TransactionAssembler (buffers until TXN_END, emits per-row)
- *   → StarRocksDynamicSinkFunctionV2 (created via SinkFunctionFactory)
+ *   → keyBy(sourcePartition) → StarRocksDynamicSinkFunctionV2
  *       internally: StreamLoadManagerV2 with multi-table transaction mode
- *       → shared label across all table regions
- *       → timer-based flush: each region sends data via /api/transaction/load
- *       → unified prepare + commit for all tables
+ *       → per-partition, per-table regions (PartitionCommitTracker)
+ *       → commit only when ALL active partitions reach txnEnd + interval elapsed
+ *       → each region sends data via /api/transaction/load
+ *       → per-region prepare + commit
  * </pre>
  *
  * <h2>Key guarantees</h2>
  * <ul>
  *   <li>Multiple Kafka transactions can map to one StarRocks transaction (N:1)</li>
  *   <li>TransactionAssembler ensures only complete Kafka transactions are emitted</li>
- *   <li>All tables in a flush cycle commit atomically (no partial table commit)</li>
+ *   <li>Per-partition regions prevent one partition's switchChunk from affecting another</li>
+ *   <li>Commit waits for all active partitions to reach txnEnd boundary</li>
  *   <li>Timer-based flush via {@code sink.buffer-flush.interval-ms}</li>
  * </ul>
  *
@@ -248,17 +250,17 @@ public class WriteMultipleTablesWithTransaction {
                 .keyBy(e -> e.partition)
                 .process(new TransactionAssembler());
 
-        // --- Partition affinity: all data from the same source partition must
-        // go to the same sink subtask to preserve within-partition ordering.
-        // Without this keyBy, Flink may rebalance rows across sink subtasks,
-        // causing out-of-order commits for the same PRIMARY KEY rows.
+        // keyBy(sourcePartition) routes same-partition data to the same sink subtask.
+        // The connector uses per-partition regions internally, so even when multiple
+        // partitions land on the same sink subtask, transaction boundaries are tracked
+        // independently per partition via PartitionCommitTracker.
         DataStream<DefaultStarRocksRowData> partitionedRows = rows
                 .keyBy(DefaultStarRocksRowData::getSourcePartition);
 
-        // --- Standard connector configuration ---
-        // sink.transaction.multi-table.enabled=true activates shared-label mode
-        // inside StreamLoadManagerV2: all table regions share one StarRocks
-        // transaction, committed together on timer-based flush.
+        // sink.transaction.multi-table.enabled=true activates per-partition region
+        // tracking inside StreamLoadManagerV2: each partition's regions are switched
+        // independently when its txnEnd arrives, and commit triggers only when all
+        // active partitions have been switched.
         StarRocksSinkOptions options = StarRocksSinkOptions.builder()
                 .withProperty("jdbc-url", jdbcUrl)
                 .withProperty("load-url", loadUrl)
