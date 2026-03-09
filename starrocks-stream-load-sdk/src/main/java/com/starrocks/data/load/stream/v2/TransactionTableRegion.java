@@ -209,19 +209,16 @@ public class TransactionTableRegion implements TableRegion {
             return 0;
         }
 
-        int c;
-        if (ctl.compareAndSet(false, true)) {
-            c = write0(row);
-        } else {
-            for (;;) {
-                if (ctl.compareAndSet(false, true)) {
-                    c = write0(row);
-                    break;
+        for (;;) {
+            if (ctl.compareAndSet(false, true)) {
+                try {
+                    return write0(row);
+                } finally {
+                    ctl.set(false);
                 }
             }
+            Thread.onSpinWait();
         }
-        ctl.set(false);
-        return c;
     }
 
     private void switchChunk() {
@@ -240,15 +237,18 @@ public class TransactionTableRegion implements TableRegion {
      * so there is no concurrent {@link #write(byte[])} call.
      */
     public void switchChunkForCommit() {
-        // Acquire the ctl spinlock to be safe (write0 also holds it during switchChunk)
         for (;;) {
             if (ctl.compareAndSet(false, true)) {
-                switchChunk();
-                ctl.set(false);
+                try {
+                    switchChunk();
+                } finally {
+                    ctl.set(false);
+                }
                 LOG.info("[MultiTxn] switchChunkForCommit: db={}, table={}, inactiveChunks={}",
                         database, table, inactiveChunks.size());
                 return;
             }
+            Thread.onSpinWait();
         }
     }
 
@@ -307,13 +307,17 @@ public class TransactionTableRegion implements TableRegion {
         if (state.compareAndSet(State.ACTIVE, State.FLUSHING)) {
             for (;;) {
                 if (ctl.compareAndSet(false, true)) {
-                    if (reason != FlushReason.BUFFER_ROWS_REACH_LIMIT ||
-                            activeChunk.numRows() >= properties.getMaxBufferRows()) {
-                        switchChunk();
+                    try {
+                        if (reason != FlushReason.BUFFER_ROWS_REACH_LIMIT ||
+                                activeChunk.numRows() >= properties.getMaxBufferRows()) {
+                            switchChunk();
+                        }
+                    } finally {
+                        ctl.set(false);
                     }
-                    ctl.set(false);
                     break;
                 }
+                Thread.onSpinWait();
             }
             if (!inactiveChunks.isEmpty()) {
                 LOG.info("Flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",

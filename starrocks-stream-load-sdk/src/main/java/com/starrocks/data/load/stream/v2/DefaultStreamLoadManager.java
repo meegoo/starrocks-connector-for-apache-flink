@@ -204,6 +204,14 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     }
 
                     if (savepoint) {
+                        if (multiTableTransactionEnabled && txnCoordinator != null && txnCoordinator.isActive()) {
+                            LOG.warn("[MultiTxn] Savepoint interrupting in-flight shared transaction; resetting coordinator");
+                            txnCoordinator.reset();
+                            commitInFlight = false;
+                            for (TransactionTableRegion region : flushQ) {
+                                region.setLabel(null);
+                            }
+                        }
                         for (TransactionTableRegion region : flushQ) {
                             boolean flush = region.flush(FlushReason.FORCE);
                             LOG.debug("Trigger flush table region {} because of savepoint, region cache bytes: {}, flush: {}",
@@ -332,74 +340,73 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     /**
      * Processes a multi-table commit cycle using the SharedTransactionCoordinator.
      * Called on the manager thread when commitInFlight=true.
+     *
+     * <p>The method is invoked repeatedly by the manager thread loop. It uses the
+     * coordinator's {@code isActive()} state to track progress across iterations:
+     * <ol>
+     *   <li>First iteration: begin shared transaction, inject label, trigger loads</li>
+     *   <li>Subsequent iterations: poll until all loads complete</li>
+     *   <li>Final iteration: unified prepare + commit, then reset</li>
+     * </ol>
      */
     private void processMultiTableCommit() {
-        // Collect regions that have inactive chunks to load
-        List<TransactionTableRegion> regionsWithData = new ArrayList<>();
-        for (TransactionTableRegion region : flushQ) {
-            if (region.triggerLoadIfNeeded()) {
-                regionsWithData.add(region);
-                LOG.debug("[MultiTxn] triggered load for region={}", region.getUniqueKey());
-            }
-        }
-
-        // Check if all regions have finished loading (state is no longer FLUSHING)
-        boolean allLoaded = true;
-        for (TransactionTableRegion region : flushQ) {
-            if (region.isFlushing()) {
-                allLoaded = false;
-                break;
-            }
-        }
-        if (!allLoaded) {
-            LOG.debug("[MultiTxn] Some regions still flushing, will retry next scan");
-            return;
-        }
-
-        // All loads complete. Now do shared begin → inject label → prepare → commit.
         try {
-            String anyDb = null;
-            String anyTable = null;
-            List<TransactionTableRegion> regionsToCommit = new ArrayList<>();
-            for (TransactionTableRegion region : flushQ) {
-                if (region.getLabel() != null) {
-                    // Region has been loaded with its own label — we need to
-                    // reset it so we can inject the shared label.
-                    // But actually, in the current flow, regions called
-                    // triggerLoadIfNeeded() which calls streamLoad() which calls
-                    // streamLoader.send(this) which calls begin(region) — each region
-                    // got its own label. We need to commit each of those individually
-                    // first, then in the next cycle use the coordinator properly.
-                    //
-                    // For now, fall back to per-region commit to avoid data loss.
-                    regionsToCommit.add(region);
+            if (!txnCoordinator.isActive()) {
+                String anyDb = null;
+                String anyTable = null;
+                for (TransactionTableRegion region : flushQ) {
+                    if (anyDb == null) {
+                        anyDb = region.getDatabase();
+                        anyTable = region.getTable();
+                    }
                 }
+
                 if (anyDb == null) {
-                    anyDb = region.getDatabase();
+                    commitInFlight = false;
+                    partitionTracker.reset();
+                    LOG.info("[MultiTxn] No regions registered; commitInFlight=false");
+                    return;
+                }
+
+                txnCoordinator.begin(anyDb, anyTable);
+
+                for (TransactionTableRegion region : flushQ) {
+                    region.setLabel(txnCoordinator.getSharedLabel());
+                    if (region.triggerLoadIfNeeded()) {
+                        LOG.debug("[MultiTxn] triggered load for region={}", region.getUniqueKey());
+                    }
+                }
+            }
+
+            for (TransactionTableRegion region : flushQ) {
+                if (region.isFlushing()) {
+                    LOG.debug("[MultiTxn] Region {} still flushing, will retry next scan",
+                            region.getUniqueKey());
+                    return;
+                }
+            }
+
+            String anyTable = null;
+            for (TransactionTableRegion region : flushQ) {
+                if (anyTable == null) {
                     anyTable = region.getTable();
                 }
             }
 
-            // Per-region commit (works with existing labels)
-            int committedCount = 0;
-            for (TransactionTableRegion region : flushQ) {
-                boolean success = region.commit();
-                if (success) {
-                    region.resetAge();
-                    committedCount++;
-                }
+            if (anyTable != null) {
+                txnCoordinator.prepareAndCommit(anyTable);
             }
 
-            if (committedCount == flushQ.size()) {
-                commitInFlight = false;
-                partitionTracker.reset();
-                LOG.info("[MultiTxn] All {} regions committed; commitInFlight=false", committedCount);
-            } else {
-                LOG.debug("[MultiTxn] {}/{} regions committed; will retry next scan",
-                        committedCount, flushQ.size());
+            for (TransactionTableRegion region : flushQ) {
+                region.setLabel(null);
+                region.resetAge();
             }
+            commitInFlight = false;
+            partitionTracker.reset();
+            LOG.info("[MultiTxn] Shared transaction committed; commitInFlight=false");
         } catch (Exception ex) {
-            LOG.error("[MultiTxn] Commit failed", ex);
+            LOG.error("[MultiTxn] Shared transaction commit failed", ex);
+            txnCoordinator.reset();
             this.e = ex;
         }
     }

@@ -74,6 +74,7 @@ public class StreamLoadManagerMultiTableTest {
 
     /**
      * Single partition: write data to two tables, send txnEnd, verify commit.
+     * Verifies that the shared transaction coordinator is used (1 begin, 1 prepare, 1 commit).
      */
     @Test
     public void testSinglePartitionWriteAndCommit() throws Exception {
@@ -82,6 +83,8 @@ public class StreamLoadManagerMultiTableTest {
         manager.init();
 
         try {
+            mockedServer.resetCounters();
+
             int partition = 0;
             manager.write(partition, "test", "orders",
                     "{\"order_id\":1, \"customer_id\":100, \"total_amount\":99.99}");
@@ -96,6 +99,11 @@ public class StreamLoadManagerMultiTableTest {
 
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
+
+            Assert.assertTrue("Expected at least 1 begin call", mockedServer.getBeginCount() >= 1);
+            Assert.assertTrue("Expected at least 1 load call", mockedServer.getLoadCount() >= 1);
+            Assert.assertTrue("Expected at least 1 prepare call", mockedServer.getPrepareCount() >= 1);
+            Assert.assertTrue("Expected at least 1 commit call", mockedServer.getCommitCount() >= 1);
         } finally {
             manager.close();
         }
@@ -143,6 +151,7 @@ public class StreamLoadManagerMultiTableTest {
 
     /**
      * Verifies that data is NOT committed while no partition has sent txnEnd.
+     * The shared begin/prepare/commit should not happen before txnEnd.
      */
     @Test
     public void testCommitNotTriggeredWithoutTxnEnd() throws Exception {
@@ -151,12 +160,16 @@ public class StreamLoadManagerMultiTableTest {
         manager.init();
 
         try {
+            mockedServer.resetCounters();
+
             manager.write(0, "test", "orders",
                     "{\"order_id\":1, \"customer_id\":100}");
             manager.setCommitAllowed(0, false);
 
             Thread.sleep(300);
             Assert.assertNull("No exception expected", manager.getException());
+            Assert.assertEquals("No begin expected before txnEnd", 0, mockedServer.getBeginCount());
+            Assert.assertEquals("No commit expected before txnEnd", 0, mockedServer.getCommitCount());
 
             manager.setCommitAllowed(0, true);
             Thread.sleep(300);

@@ -23,6 +23,9 @@ package com.starrocks.data.load.stream.properties;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.starrocks.data.load.stream.StarRocksVersion;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Collections;
@@ -33,6 +36,9 @@ import java.util.Objects;
 import static org.apache.http.protocol.HttpRequestExecutor.DEFAULT_WAIT_FOR_CONTINUE;
 
 public class StreamLoadProperties implements Serializable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(StreamLoadProperties.class);
+
     private final String jdbcUrl;
     private final String[] loadUrls;
     private final String username;
@@ -611,7 +617,23 @@ public class StreamLoadProperties implements Serializable {
         }
 
         public StreamLoadProperties build() {
+            if (enableMultiTableTransaction && !enableTransaction) {
+                throw new IllegalArgumentException(
+                        "Multi-table transaction mode requires transaction stream load to be enabled");
+            }
             StreamLoadProperties streamLoadProperties = new StreamLoadProperties(this);
+
+            if (enableMultiTableTransaction) {
+                StarRocksVersion v = streamLoadProperties.getStarRocksVersion();
+                if (v != null && v.getMajor() < 4) {
+                    throw new IllegalArgumentException(String.format(
+                            "Multi-table transaction mode requires StarRocks >= 4.0, but current version is %d.%d.%d",
+                            v.getMajor(), v.getMinor(), v.getPatch()));
+                }
+                if (v == null) {
+                    LOG.warn("StarRocks version is unknown; multi-table transaction mode requires >= 4.0");
+                }
+            }
 
             if (streamLoadProperties.getYoungThreshold() >= streamLoadProperties.getOldThreshold()) {
                 throw new IllegalArgumentException(String.format("oldThreshold(`%s`) must greater to youngThreshold(`%s`)",

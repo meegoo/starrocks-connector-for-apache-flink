@@ -134,4 +134,17 @@ public class SharedTransactionCoordinator {
     public boolean isActive() {
         return sharedLabel != null;
     }
+
+    /**
+     * Resets the coordinator state without committing. Used on error paths
+     * and savepoint interruption to abandon the in-progress shared transaction.
+     * The StarRocks-side transaction will be cleaned up by its timeout.
+     */
+    public void reset() {
+        if (sharedLabel != null) {
+            LOG.warn("[MultiTxn] SharedTransactionCoordinator reset, abandoning label={}", sharedLabel);
+        }
+        this.sharedLabel = null;
+        this.database = null;
+    }
 }

@@ -538,6 +538,14 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         options.addTableProperties(StreamLoadTableProperties.builder()
                 .database(DB_NAME)
+                .table(ordersTable)
+                .addProperty("format", "json")
+                .addProperty("strip_outer_array", "true")
+                .addProperty("ignore_json_size", "true")
+                .build());
+
+        options.addTableProperties(StreamLoadTableProperties.builder()
+                .database(DB_NAME)
                 .table(orderItemsTable)
                 .addProperty("format", "json")
                 .addProperty("strip_outer_array", "true")
