@@ -110,7 +110,6 @@ public class TransactionTableRegion implements TableRegion {
         this.activeChunk = new Chunk(properties.getDataFormat(), chunkIdGenerator.getAndIncrement());
         this.maxRetries = maxRetries;
         this.retryIntervalInMs = retryIntervalInMs;
-        initHeaders(properties);
     }
 
     private void initHeaders(StreamLoadTableProperties properties) {
@@ -320,7 +319,7 @@ public class TransactionTableRegion implements TableRegion {
                 Thread.onSpinWait();
             }
             if (!inactiveChunks.isEmpty()) {
-                LOG.info("Flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
+                LOG.debug("Flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
                         database, table, label, cacheBytes.get(), cacheRows.get(), reason);
                 streamLoad(0);
                 return true;
@@ -440,13 +439,13 @@ public class TransactionTableRegion implements TableRegion {
         firstException = null;
 
         if (!inactiveChunks.isEmpty()) {
-            LOG.info("Stream load continue, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
+            LOG.debug("Stream load continue, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
                     database, table, label, cacheBytes, cacheRows);
             streamLoad(0);
             return;
         }
         if (state.compareAndSet(State.FLUSHING, State.ACTIVE)) {
-            LOG.info("Stream load completed, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
+            LOG.debug("Stream load completed, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
                     database, table, label, cacheBytes, cacheRows);
         }
     }
@@ -459,7 +458,11 @@ public class TransactionTableRegion implements TableRegion {
     protected void streamLoad(int delayMs) {
         try {
             Chunk chunk = inactiveChunks.peek();
-            LOG.info("Stream load chunk, db: {}, table: {}, numRows: {}, rowBytes: {}, chunkBytes: {}",
+            if (chunk == null) {
+                LOG.warn("No inactive chunk available for stream load, db: {}, table: {}", database, table);
+                return;
+            }
+            LOG.debug("Stream load chunk, db: {}, table: {}, numRows: {}, rowBytes: {}, chunkBytes: {}",
                     database, table, chunk.numRows(), chunk.rowBytes(), chunk.chunkBytes());
             responseFuture = streamLoader.send(this, delayMs);
         } catch (Exception e) {
@@ -469,7 +472,11 @@ public class TransactionTableRegion implements TableRegion {
 
     @Override
     public HttpEntity getHttpEntity() {
-        ChunkHttpEntity entity = new ChunkHttpEntity(uniqueKey, inactiveChunks.peek());
+        Chunk chunk = inactiveChunks.peek();
+        if (chunk == null) {
+            throw new IllegalStateException("No inactive chunk available for HTTP entity, db: " + database + ", table: " + table);
+        }
+        ChunkHttpEntity entity = new ChunkHttpEntity(uniqueKey, chunk);
         return compressionCodec
                 .map(codec -> (HttpEntity) new CompressionHttpEntity(entity, codec))
                 .orElse(entity);

@@ -120,7 +120,16 @@ public class StarRocksSinkOptions implements Serializable {
     public static final ConfigOption<Boolean> SINK_MULTI_TABLE_TXN_ENABLED = ConfigOptions.key("sink.transaction.multi-table.enabled")
             .booleanType().defaultValue(false).withDescription("Whether to enable multi-table atomic transaction. " +
                     "When enabled, all tables written within the same flush cycle share one StarRocks transaction label, " +
-                    "and are atomically committed together. Requires StarRocks >= 4.0 and sink.version=V2.");
+                    "and are atomically committed together. Requires StarRocks >= 4.0 and sink.version=V2. " +
+                    "Only at-least-once semantics is supported; exactly-once is not compatible with multi-table transactions.");
+
+    public static final ConfigOption<Long> SINK_MULTI_TABLE_TXN_BUFFER_SIZE =
+            ConfigOptions.key("sink.transaction.multi-table.buffer-size")
+                    .longType()
+                    .defaultValue(128L * MEGA_BYTES_SCALE)
+                    .withDescription("Global buffer size in bytes for multi-table transaction mode. " +
+                            "When the total buffered data across all tables reaches this threshold, " +
+                            "a flush is triggered. Default is 128MB.");
 
     public static final ConfigOption<Integer> SINK_MAX_RETRIES = ConfigOptions.key("sink.max-retries")
             .intType().defaultValue(3).withDescription("Max flushing retry times of the row batch.");
@@ -231,6 +240,7 @@ public class StarRocksSinkOptions implements Serializable {
         validateSinkSemantic();
         validateParamsRange();
         validateMergeCommit();
+        validateMultiTableTransaction();
     }
 
     public void setTableSchemaFieldNames(String[] fieldNames) {
@@ -356,6 +366,10 @@ public class StarRocksSinkOptions implements Serializable {
 
     public boolean isMultiTableTransactionEnabled() {
         return tableOptions.get(SINK_MULTI_TABLE_TXN_ENABLED);
+    }
+
+    public long getMultiTableTransactionBufferSize() {
+        return tableOptions.get(SINK_MULTI_TABLE_TXN_BUFFER_SIZE);
     }
 
     public Map<String, String> getSinkStreamLoadProperties() {
@@ -515,6 +529,17 @@ public class StarRocksSinkOptions implements Serializable {
         }
     }
 
+    private void validateMultiTableTransaction() {
+        if (!tableOptions.get(SINK_MULTI_TABLE_TXN_ENABLED)) {
+            return;
+        }
+        if (sinkSemantic == StarRocksSinkSemantic.EXACTLY_ONCE) {
+            throw new ValidationException(
+                    "Multi-table transaction stream load does not support exactly-once semantics. " +
+                    "Please use at-least-once semantics with '" + SINK_MULTI_TABLE_TXN_ENABLED.key() + "'.");
+        }
+    }
+
     private void parseSinkStreamLoadProperties() {
         tableOptionsMap.keySet().stream()
                 .filter(key -> key.startsWith(SINK_PROPERTIES_PREFIX))
@@ -651,6 +676,7 @@ public class StarRocksSinkOptions implements Serializable {
         if (isMultiTableTransactionEnabled()) {
             builder.enableTransaction();
             builder.enableMultiTableTransaction();
+            builder.multiTableTransactionBufferSize(getMultiTableTransactionBufferSize());
             log.info("Enable multi-table transaction stream load");
         }
         return builder.build();
