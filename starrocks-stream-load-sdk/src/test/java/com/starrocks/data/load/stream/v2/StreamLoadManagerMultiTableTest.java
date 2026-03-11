@@ -223,22 +223,86 @@ public class StreamLoadManagerMultiTableTest {
     }
 
     /**
-     * Savepoint (flush) works in multi-table mode.
+     * Savepoint (flush) commits the active shared transaction even when
+     * txnEnd has not been received (interval-based commit threshold is very high).
+     * Verifies exactly 1 begin + prepare + commit via the savepoint path.
      */
     @Test
     public void testSavepointCommitsMultiTableTransaction() throws Exception {
-        StreamLoadProperties properties = buildMultiTableProperties(60000);
+        StreamLoadProperties properties = buildMultiTableProperties(60000); // 60s interval — never fires
         StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
         manager.init();
 
         try {
+            mockedServer.resetCounters();
+
             manager.write(0, "test", "orders",
                     "{\"order_id\":1, \"customer_id\":100}");
             manager.write(0, "test", "order_items",
                     "{\"item_id\":1, \"order_id\":1}");
 
+            // setCommitAllowed(0, true) is NOT called — flush() must commit via savepoint path
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
+
+            // The savepoint path commits any active shared transaction.
+            // Exactly 1 begin/prepare/commit must be issued regardless of txnEnd.
+            Assert.assertEquals("Savepoint should issue exactly 1 begin",
+                    1, mockedServer.getBeginCount());
+            Assert.assertEquals("Savepoint should issue exactly 1 prepare",
+                    1, mockedServer.getPrepareCount());
+            Assert.assertEquals("Savepoint should issue exactly 1 commit",
+                    1, mockedServer.getCommitCount());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * An evicted (idle) partition that later receives txnEnd should be
+     * automatically re-registered and participate in the next commit cycle.
+     *
+     * <p>This tests the {@code onTxnEnd()} fix that re-registers evicted partitions
+     * instead of ignoring them.
+     */
+    @Test
+    public void testEvictedPartitionReRegisters() throws Exception {
+        // Very short interval (100 ms) to trigger multiple rapid commit cycles
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Commit cycle 1 — only partition 0
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // Commit cycle 2 — only partition 0 (partition 0 resets to ACTIVE)
+            manager.write(0, "test", "orders", "{\"order_id\":2}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // Commit cycle 3 — only partition 0 (3rd cycle: idle count reaches MAX_IDLE_CYCLES)
+            manager.write(0, "test", "orders", "{\"order_id\":3}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // After 3 idle commit cycles, partition 0 would be evicted.
+            // Now partition 0 sends txnEnd again — it must be re-registered, not ignored.
+            manager.write(0, "test", "orders", "{\"order_id\":4}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            manager.flush();
+            Assert.assertNull("No exception expected after evicted partition re-registers",
+                    manager.getException());
+
+            // At least 4 complete commit cycles must have occurred
+            Assert.assertTrue("Expected at least 4 commits across re-registration cycles",
+                    mockedServer.getCommitCount() >= 4);
         } finally {
             manager.close();
         }

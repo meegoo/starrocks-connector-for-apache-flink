@@ -227,9 +227,12 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             for (TransactionTableRegion region : flushQ) {
                                 region.triggerLoadIfNeeded();
                             }
-                            // Wait for triggered loads to complete
+                            // Wait for triggered loads to complete.
+                            // Also exit early if a load error was recorded (this.e != null):
+                            // when a region exhausts retries, fail() sets this.e but leaves
+                            // the region in FLUSHING state, causing an infinite spin otherwise.
                             boolean allLoadsDone = false;
-                            while (!allLoadsDone) {
+                            while (!allLoadsDone && this.e == null) {
                                 allLoadsDone = true;
                                 for (TransactionTableRegion region : flushQ) {
                                     if (region.isFlushing()) {
@@ -237,18 +240,18 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                         break;
                                     }
                                 }
-                                if (!allLoadsDone) {
+                                if (!allLoadsDone && this.e == null) {
                                     LockSupport.parkNanos(1_000_000L);
                                 }
                             }
-                            // Commit the shared transaction to avoid losing loaded data
+                            // Only commit if all loads completed without error
                             String anyTable = null;
                             for (TransactionTableRegion region : flushQ) {
                                 if (anyTable == null) {
                                     anyTable = region.getTable();
                                 }
                             }
-                            if (anyTable != null) {
+                            if (allLoadsDone && anyTable != null) {
                                 try {
                                     txnCoordinator.prepareAndCommit(anyTable);
                                     LOG.info("[MultiTxn] Shared transaction committed during savepoint");
@@ -262,8 +265,12 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             if (partitionTracker != null) {
                                 partitionTracker.reset();
                             }
+                            // Skip setLabel(null) for regions that are actively retrying
+                            // (same policy as processMultiTableCommit's catch block).
                             for (TransactionTableRegion region : flushQ) {
-                                region.setLabel(null);
+                                if (!region.isRetrying()) {
+                                    region.setLabel(null);
+                                }
                             }
                         }
                         for (TransactionTableRegion region : flushQ) {
