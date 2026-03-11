@@ -50,9 +50,9 @@ public class SharedTransactionCoordinator {
     private final StreamLoader streamLoader;
     private final LabelGeneratorFactory labelGeneratorFactory;
 
-    private volatile String sharedLabel;
-    private volatile String database;
-    private volatile String table;
+    private String sharedLabel;
+    private String database;
+    private String table;
 
     public SharedTransactionCoordinator(StreamLoader streamLoader,
                                         LabelGeneratorFactory labelGeneratorFactory) {
@@ -70,7 +70,7 @@ public class SharedTransactionCoordinator {
      * @param database the database (all tables must be in the same database)
      * @param anyTable any table in the database (StarRocks requires a table in begin)
      */
-    public void begin(String database, String anyTable) {
+    public synchronized void begin(String database, String anyTable) {
         LabelGenerator generator = labelGeneratorFactory.create(database, anyTable);
         this.sharedLabel = generator.next();
         this.database = database;
@@ -93,7 +93,7 @@ public class SharedTransactionCoordinator {
      * (because {@code TransactionStreamLoader.begin(region)} skips begin when
      * label is already set).
      */
-    public void injectLabel(Collection<TransactionTableRegion> regions) {
+    public synchronized void injectLabel(Collection<TransactionTableRegion> regions) {
         for (TransactionTableRegion region : regions) {
             region.setLabel(sharedLabel);
         }
@@ -108,7 +108,7 @@ public class SharedTransactionCoordinator {
      *
      * @param anyTable any table in the database
      */
-    public void prepareAndCommit(String anyTable) {
+    public synchronized void prepareAndCommit(String anyTable) {
         StreamLoadSnapshot.Transaction txn =
                 new StreamLoadSnapshot.Transaction(database, anyTable, sharedLabel);
 
@@ -130,11 +130,11 @@ public class SharedTransactionCoordinator {
         this.table = null;
     }
 
-    public String getSharedLabel() {
+    public synchronized String getSharedLabel() {
         return sharedLabel;
     }
 
-    public boolean isActive() {
+    public synchronized boolean isActive() {
         return sharedLabel != null;
     }
 
@@ -143,7 +143,7 @@ public class SharedTransactionCoordinator {
      * Used on error paths and savepoint interruption. If rollback fails, the
      * StarRocks-side transaction will be cleaned up by its timeout.
      */
-    public void reset() {
+    public synchronized void reset() {
         if (sharedLabel != null) {
             LOG.warn("[MultiTxn] SharedTransactionCoordinator reset, attempting rollback for label={}", sharedLabel);
             try {

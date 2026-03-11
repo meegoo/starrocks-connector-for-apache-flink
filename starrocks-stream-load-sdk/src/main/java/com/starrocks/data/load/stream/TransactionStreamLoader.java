@@ -185,7 +185,8 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         } catch (StreamLoadFailException se) {
             throw se;
         } catch (Exception e) {
-            throw new RuntimeException(e);
+            throw new RuntimeException("Failed to begin transaction, label: " + label
+                    + ", db: " + database + ", table: " + table, e);
         }
     }
 
@@ -289,7 +290,7 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
                 responseBody = parseHttpResponse("commit transaction", transaction.getDatabase(), transaction.getTable(),
                         transaction.getLabel(), response);
             }
-            log.info("Transaction committed, lable: {}, body : {}", transaction.getLabel(), responseBody);
+            log.info("Transaction committed, label: {}, body : {}", transaction.getLabel(), responseBody);
 
             StreamLoadResponse streamLoadResponse = new StreamLoadResponse();
             StreamLoadResponse.StreamLoadResponseBody streamLoadBody =
