@@ -105,7 +105,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     private volatile boolean allRegionsCommitted;
     private long flushTimeoutMs = 660000L; // default stream load timeout is 600s, 1.1x for flush
 
-    private volatile boolean commitInFlight = false;
+    private final AtomicBoolean commitInFlight = new AtomicBoolean(false);
 
     private final Lock lock = new ReentrantLock();
     private final Condition writable = lock.newCondition();
@@ -258,7 +258,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 }
                             }
                             txnCoordinator.reset();
-                            commitInFlight = false;
+                            commitInFlight.set(false);
                             if (partitionTracker != null) {
                                 partitionTracker.reset();
                             }
@@ -295,7 +295,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             }
                         }
                         LockSupport.unpark(current);
-                    } else if (commitInFlight) {
+                    } else if (commitInFlight.get()) {
                         // Multi-table coordinator-based commit (manager thread)
                         processMultiTableCommit();
                     } else {
@@ -379,8 +379,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     pRegions == null ? 0 : pRegions.size());
         }
 
-        if (partitionTracker.allSwitched() && !commitInFlight) {
-            commitInFlight = true;
+        // compareAndSet prevents a race where two concurrent trySwitchAndCommit() calls
+        // both see commitInFlight==false and both try to start a commit cycle.
+        if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
             lock.lock();
             try {
                 flushable.signal();
@@ -431,7 +432,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 }
 
                 if (anyDb == null) {
-                    commitInFlight = false;
+                    commitInFlight.set(false);
                     partitionTracker.reset();
                     LOG.info("[MultiTxn] No regions registered; commitInFlight=false");
                     return;
@@ -470,13 +471,13 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 region.setLabel(null);
                 region.resetAge();
             }
-            commitInFlight = false;
+            commitInFlight.set(false);
             partitionTracker.reset();
             LOG.info("[MultiTxn] Shared transaction committed; commitInFlight=false");
         } catch (Exception ex) {
             LOG.error("[MultiTxn] Shared transaction commit failed", ex);
             txnCoordinator.reset();
-            commitInFlight = false;
+            commitInFlight.set(false);
             partitionTracker.reset();
             for (TransactionTableRegion region : regionSnapshot) {
                 region.setLabel(null);
@@ -503,36 +504,45 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                         uniqueKey == null ? "null" : uniqueKey, database, table, row);
             }
             int bytes = region.write(row.getBytes(StandardCharsets.UTF_8));
-            long cachedBytes = currentCacheBytes.addAndGet(bytes);
-            if (cachedBytes >= maxWriteBlockCacheBytes) {
-                long startTime = System.nanoTime();
-                lock.lock();
-                try {
-                    int idx = 0;
-                    while (currentCacheBytes.get() >= maxWriteBlockCacheBytes) {
-                        checkAndThrowException();
-                        LOG.info("Cache full, wait flush, currentBytes: {}, maxWriteBlockCacheBytes: {}",
-                                currentCacheBytes.get(), maxWriteBlockCacheBytes);
-                        flushable.signal();
-                        writable.await(Math.min(++idx, 5), TimeUnit.SECONDS);
-                    }
-                } catch (InterruptedException ex) {
-                    this.e = ex;
-                    throw new RuntimeException(ex);
-                } finally {
-                    lock.unlock();
-                }
-                loadMetrics.updateWriteBlock(1, System.nanoTime() - startTime);
-            } else if (cachedBytes >= maxCacheBytes && writeTriggerFlush.compareAndSet(false, true)) {
-                lock.lock();
-                try {
+            blockIfCacheFull(currentCacheBytes.addAndGet(bytes));
+        }
+    }
+
+    /**
+     * Blocks the calling (task) thread if the write-side cache is full, and signals
+     * the manager thread to flush when the soft threshold is reached.
+     *
+     * <p>Extracted to avoid duplication between the two {@code write()} overloads.
+     */
+    private void blockIfCacheFull(long cachedBytes) {
+        if (cachedBytes >= maxWriteBlockCacheBytes) {
+            long startTime = System.nanoTime();
+            lock.lock();
+            try {
+                int idx = 0;
+                while (currentCacheBytes.get() >= maxWriteBlockCacheBytes) {
+                    checkAndThrowException();
+                    LOG.info("Cache full, wait flush, currentBytes: {}, maxWriteBlockCacheBytes: {}",
+                            currentCacheBytes.get(), maxWriteBlockCacheBytes);
                     flushable.signal();
-                } finally {
-                    lock.unlock();
+                    writable.await(Math.min(++idx, 5), TimeUnit.SECONDS);
                 }
-                loadMetrics.updateWriteTriggerFlush(1);
-                LOG.info("Trigger flush, currentBytes: {}, maxCacheBytes: {}", cachedBytes, maxCacheBytes);
+            } catch (InterruptedException ex) {
+                this.e = ex;
+                throw new RuntimeException(ex);
+            } finally {
+                lock.unlock();
             }
+            loadMetrics.updateWriteBlock(1, System.nanoTime() - startTime);
+        } else if (cachedBytes >= maxCacheBytes && writeTriggerFlush.compareAndSet(false, true)) {
+            lock.lock();
+            try {
+                flushable.signal();
+            } finally {
+                lock.unlock();
+            }
+            loadMetrics.updateWriteTriggerFlush(1);
+            LOG.info("Trigger flush, currentBytes: {}, maxCacheBytes: {}", cachedBytes, maxCacheBytes);
         }
     }
 
@@ -603,21 +613,28 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         long startTime = System.currentTimeMillis();
         long waitTime = 100; // Initial wait time: 100ms
 
-        while (!isSavepointFinished()) {
-            checkFlushTimeout(startTime);
+        try {
+            while (!isSavepointFinished()) {
+                checkFlushTimeout(startTime);
 
-            triggerFlushSignal();
-            LockSupport.park(current);
+                triggerFlushSignal();
+                LockSupport.park(current);
 
-            if (!savepoint) {
-                break;
+                if (!savepoint) {
+                    break;
+                }
+
+                waitForRegionResults(waitTime);
+                waitTime = calculateNextWaitTime(waitTime);
             }
 
-            waitForRegionResults(waitTime);
-            waitTime = calculateNextWaitTime(waitTime);
+            finishFlush();
+        } finally {
+            // Ensure the savepoint flag is always cleared even if checkFlushTimeout()
+            // or finishFlush() throw, so the manager thread does not keep acting on
+            // a stale savepoint signal after flush() has already returned.
+            savepoint = false;
         }
-
-        finishFlush();
     }
 
     private void initializeFlushState() {
@@ -745,35 +762,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         for (String row : rows) {
             checkAndThrowException();
             int bytes = region.write(row.getBytes(StandardCharsets.UTF_8));
-            long cachedBytes = currentCacheBytes.addAndGet(bytes);
-            if (cachedBytes >= maxWriteBlockCacheBytes) {
-                long startTime = System.nanoTime();
-                lock.lock();
-                try {
-                    int idx = 0;
-                    while (currentCacheBytes.get() >= maxWriteBlockCacheBytes) {
-                        checkAndThrowException();
-                        LOG.info("Cache full, wait flush, currentBytes: {}, maxWriteBlockCacheBytes: {}",
-                                currentCacheBytes.get(), maxWriteBlockCacheBytes);
-                        flushable.signal();
-                        writable.await(Math.min(++idx, 5), TimeUnit.SECONDS);
-                    }
-                } catch (InterruptedException ex) {
-                    this.e = ex;
-                    throw new RuntimeException(ex);
-                } finally {
-                    lock.unlock();
-                }
-                loadMetrics.updateWriteBlock(1, System.nanoTime() - startTime);
-            } else if (cachedBytes >= maxCacheBytes && writeTriggerFlush.compareAndSet(false, true)) {
-                lock.lock();
-                try {
-                    flushable.signal();
-                } finally {
-                    lock.unlock();
-                }
-                loadMetrics.updateWriteTriggerFlush(1);
-            }
+            blockIfCacheFull(currentCacheBytes.addAndGet(bytes));
         }
     }
 
