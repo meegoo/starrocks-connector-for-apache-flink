@@ -167,7 +167,12 @@ public class TransactionTableRegion implements TableRegion {
     public void setLabel(String label) {
         // Reuse the same label to avoid duplicate load if retry happens
         if (numRetries > 0 && label != null) {
-            return;
+            LOG.warn("[MultiTxn] setLabel called with label={} while numRetries={}, "
+                    + "existing label={}. Rejecting to preserve retry consistency.",
+                    label, numRetries, this.label);
+            throw new IllegalStateException(
+                    "Cannot set label while region is retrying (numRetries=" + numRetries
+                    + ", existingLabel=" + this.label + ", newLabel=" + label + ")");
         }
         this.label = label;
     }
@@ -216,7 +221,7 @@ public class TransactionTableRegion implements TableRegion {
                     ctl.set(false);
                 }
             }
-            // yield to reduce CPU usage during spin
+            Thread.yield();
         }
     }
 
@@ -247,7 +252,7 @@ public class TransactionTableRegion implements TableRegion {
                         database, table, inactiveChunks.size());
                 return;
             }
-            // yield to reduce CPU usage during spin
+            Thread.yield();
         }
     }
 
@@ -316,7 +321,7 @@ public class TransactionTableRegion implements TableRegion {
                     }
                     break;
                 }
-                // yield to reduce CPU usage during spin
+                Thread.yield();
             }
             if (!inactiveChunks.isEmpty()) {
                 LOG.debug("Flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
@@ -398,6 +403,7 @@ public class TransactionTableRegion implements TableRegion {
         } catch (Throwable e) {
             LOG.error("TransactionTableRegion commit failed, db: {}, table: {}, label: {}", database, table, label, e);
             fail(e);
+            return;
         }
 
         long commitTime = System.currentTimeMillis();

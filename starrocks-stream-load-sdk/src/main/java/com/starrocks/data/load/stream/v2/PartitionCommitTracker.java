@@ -53,7 +53,7 @@ public class PartitionCommitTracker {
 
     private final Map<Integer, PartitionState> partitions = new LinkedHashMap<>();
     private final long commitIntervalMs;
-    private long lastCommitTimeMs;
+    private volatile long lastCommitTimeMs;
 
     public PartitionCommitTracker(long commitIntervalMs) {
         this.commitIntervalMs = commitIntervalMs;
@@ -64,7 +64,7 @@ public class PartitionCommitTracker {
      * Called when data is written for a partition. Registers the partition as active
      * if not already tracked (or re-activates it after a commit reset).
      */
-    public void onWrite(int partition) {
+    public synchronized void onWrite(int partition) {
         partitions.putIfAbsent(partition, PartitionState.ACTIVE);
     }
 
@@ -73,7 +73,7 @@ public class PartitionCommitTracker {
      *
      * @return {@code true} if the flush interval has elapsed (caller should attempt switch)
      */
-    public boolean onTxnEnd(int partition) {
+    public synchronized boolean onTxnEnd(int partition) {
         PartitionState state = partitions.get(partition);
         if (state == null) {
             LOG.warn("[MultiTxn] txnEnd for unknown partition {}, ignoring", partition);
@@ -88,7 +88,7 @@ public class PartitionCommitTracker {
     }
 
     /** Marks a partition as switched (its regions have been frozen for commit). */
-    public void markSwitched(int partition) {
+    public synchronized void markSwitched(int partition) {
         partitions.put(partition, PartitionState.SWITCHED);
         LOG.debug("[MultiTxn] partition {} marked SWITCHED", partition);
     }
@@ -97,7 +97,7 @@ public class PartitionCommitTracker {
      * Returns partitions that have reached txnEnd but have not yet been switched.
      * Only returns results when the flush interval has elapsed.
      */
-    public List<Integer> getReadyToSwitch() {
+    public synchronized List<Integer> getReadyToSwitch() {
         if (!isIntervalElapsed()) {
             return Collections.emptyList();
         }
@@ -111,7 +111,7 @@ public class PartitionCommitTracker {
     }
 
     /** Returns {@code true} when all tracked partitions have been switched. */
-    public boolean allSwitched() {
+    public synchronized boolean allSwitched() {
         if (partitions.isEmpty()) {
             return false;
         }
@@ -134,7 +134,7 @@ public class PartitionCommitTracker {
      * Partitions that received new txnEnd during the commit phase retain
      * their TXN_END_RECEIVED state for the next commit cycle.
      */
-    public void reset() {
+    public synchronized void reset() {
         lastCommitTimeMs = System.currentTimeMillis();
         partitions.replaceAll((partition, state) -> {
             if (state == PartitionState.SWITCHED) {
@@ -145,12 +145,12 @@ public class PartitionCommitTracker {
         LOG.info("[MultiTxn] PartitionCommitTracker reset, partitions: {}", partitions);
     }
 
-    public boolean isEmpty() {
+    public synchronized boolean isEmpty() {
         return partitions.isEmpty();
     }
 
     @Override
-    public String toString() {
+    public synchronized String toString() {
         return "PartitionCommitTracker{" +
                 "partitions=" + partitions +
                 ", lastCommitTimeMs=" + lastCommitTimeMs +
