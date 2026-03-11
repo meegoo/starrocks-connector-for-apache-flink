@@ -153,7 +153,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             maxRetries = properties.getMaxRetries();
             retryIntervalInMs = properties.getRetryIntervalInMs();
         }
-        this.maxCacheBytes = properties.getMaxCacheBytes();
+        if (properties.isEnableMultiTableTransaction() && properties.getMultiTableTransactionBufferSize() > 0) {
+            this.maxCacheBytes = properties.getMultiTableTransactionBufferSize();
+        } else {
+            this.maxCacheBytes = properties.getMaxCacheBytes();
+        }
         this.maxWriteBlockCacheBytes = 2 * maxCacheBytes;
         this.scanningFrequency = properties.getScanningFrequency();
         this.multiTableTransactionEnabled = properties.isEnableMultiTableTransaction();
@@ -267,11 +271,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 }
             }, "StarRocks-Sink-Manager");
             manager.setDaemon(true);
-            manager.start();
             manager.setUncaughtExceptionHandler((t, ee) -> {
                 LOG.error("StarRocks-Sink-Manager error", ee);
                 e = ee;
             });
+            manager.start();
             LOG.info("StarRocks-Sink-Manager start, enableAutoCommit: {}, streamLoader: {}, {}",
                     enableAutoCommit, streamLoader.getClass().getName(), EnvUtils.getGitInformation());
 
@@ -423,7 +427,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     public void write(String uniqueKey, String database, String table, String... rows) {
         TableRegion region = getCacheRegion(uniqueKey, database, table);
         for (String row : rows) {
-            AssertNotException();
+            checkAndThrowException();
             if (LOG.isTraceEnabled()) {
                 LOG.trace("Write uniqueKey {}, database {}, table {}, row {}",
                         uniqueKey == null ? "null" : uniqueKey, database, table, row);
@@ -436,7 +440,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 try {
                     int idx = 0;
                     while (currentCacheBytes.get() >= maxWriteBlockCacheBytes) {
-                        AssertNotException();
+                        checkAndThrowException();
                         LOG.info("Cache full, wait flush, currentBytes: {}, maxWriteBlockCacheBytes: {}",
                                 currentCacheBytes.get(), maxWriteBlockCacheBytes);
                         flushable.signal();
@@ -470,7 +474,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         }
         writeTriggerFlush.set(false);
 
-        LOG.info("Receive load response, cacheByteBeforeFlush: {}, currentCacheBytes: {}, totalFlushRows : {}",
+        LOG.debug("Receive load response, cacheByteBeforeFlush: {}, currentCacheBytes: {}, totalFlushRows : {}",
                 cacheByteBeforeFlush, currentCacheBytes.get(), totalFlushRows.get());
 
         lock.lock();
@@ -601,7 +605,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     private void finishFlush() {
         LOG.info("Stream load manager flush finished - currentCacheBytes: {}, maxCacheBytes: {}, allRegionsCommitted: {}",
                 currentCacheBytes.get(), maxCacheBytes, allRegionsCommitted);
-        AssertNotException();
+        checkAndThrowException();
         savepoint = false;
     }
 
@@ -647,10 +651,10 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         if (e != null) {
             return true;
         }
-        return currentCacheBytes.compareAndSet(0L, 0L) && (!enableAutoCommit || allRegionsCommitted);
+        return currentCacheBytes.get() == 0L && (!enableAutoCommit || allRegionsCommitted);
     }
 
-    private void AssertNotException() {
+    private void checkAndThrowException() {
         if (e != null) {
             LOG.error("catch exception, wait rollback ", e);
             streamLoader.rollback(snapshot());
@@ -669,7 +673,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         partitionTracker.onWrite(partition);
         TableRegion region = getCacheRegion(uniqueKey, database, table, partition);
         for (String row : rows) {
-            AssertNotException();
+            checkAndThrowException();
             int bytes = region.write(row.getBytes(StandardCharsets.UTF_8));
             long cachedBytes = currentCacheBytes.addAndGet(bytes);
             if (cachedBytes >= maxWriteBlockCacheBytes) {
@@ -678,7 +682,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 try {
                     int idx = 0;
                     while (currentCacheBytes.get() >= maxWriteBlockCacheBytes) {
-                        AssertNotException();
+                        checkAndThrowException();
                         LOG.info("Cache full, wait flush, currentBytes: {}, maxWriteBlockCacheBytes: {}",
                                 currentCacheBytes.get(), maxWriteBlockCacheBytes);
                         flushable.signal();

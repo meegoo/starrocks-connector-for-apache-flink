@@ -51,6 +51,8 @@ public class FlushAndCommitStrategy implements StreamLoadStrategy {
     public FlushAndCommitStrategy(StreamLoadProperties properties, boolean enableAutoCommit) {
         this.expectDelayTime = properties.getExpectDelayTime();
         this.scanFrequency = properties.getScanningFrequency();
+        // Integer division: commit may trigger slightly earlier than expectDelayTime
+        // when expectDelayTime is not evenly divisible by scanFrequency
         this.ageThreshold = expectDelayTime / scanFrequency;
         this.maxCacheBytes = properties.getMaxCacheBytes();
         this.enableAutoCommit = enableAutoCommit;

@@ -55,6 +55,7 @@ public class StreamLoadProperties implements Serializable {
 
     private final boolean enableTransaction;
     private final boolean enableMultiTableTransaction;
+    private final long multiTableTransactionBufferSize;
 
     // manager settings
     /**
@@ -124,6 +125,7 @@ public class StreamLoadProperties implements Serializable {
 
         this.enableTransaction = builder.enableTransaction;
         this.enableMultiTableTransaction = builder.enableMultiTableTransaction;
+        this.multiTableTransactionBufferSize = builder.multiTableTransactionBufferSize;
 
         this.labelPrefix = builder.labelPrefix;
 
@@ -169,6 +171,10 @@ public class StreamLoadProperties implements Serializable {
 
     public boolean isEnableMultiTableTransaction() {
         return enableMultiTableTransaction;
+    }
+
+    public long getMultiTableTransactionBufferSize() {
+        return multiTableTransactionBufferSize;
     }
 
     public String getJdbcUrl() {
@@ -343,6 +349,7 @@ public class StreamLoadProperties implements Serializable {
 
         private boolean enableTransaction;
         private boolean enableMultiTableTransaction;
+        private long multiTableTransactionBufferSize = 128 * 1024 * 1024; // 128MB default
 
         private String labelPrefix = "";
 
@@ -424,6 +431,14 @@ public class StreamLoadProperties implements Serializable {
         public Builder enableMultiTableTransaction() {
             this.enableMultiTableTransaction = true;
             this.enableTransaction = true;
+            return this;
+        }
+
+        public Builder multiTableTransactionBufferSize(long bufferSize) {
+            if (bufferSize <= 0) {
+                throw new IllegalArgumentException("multiTableTransactionBufferSize must be greater than 0, got: " + bufferSize);
+            }
+            this.multiTableTransactionBufferSize = bufferSize;
             return this;
         }
 
