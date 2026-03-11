@@ -50,8 +50,9 @@ public class SharedTransactionCoordinator {
     private final StreamLoader streamLoader;
     private final LabelGeneratorFactory labelGeneratorFactory;
 
-    private String sharedLabel;
-    private String database;
+    private volatile String sharedLabel;
+    private volatile String database;
+    private volatile String table;
 
     public SharedTransactionCoordinator(StreamLoader streamLoader,
                                         LabelGeneratorFactory labelGeneratorFactory) {
@@ -73,6 +74,7 @@ public class SharedTransactionCoordinator {
         LabelGenerator generator = labelGeneratorFactory.create(database, anyTable);
         this.sharedLabel = generator.next();
         this.database = database;
+        this.table = anyTable;
 
         LOG.info("[MultiTxn] SharedTransaction begin: label={}, db={}, table={}",
                 sharedLabel, database, anyTable);
@@ -125,6 +127,7 @@ public class SharedTransactionCoordinator {
         LOG.info("[MultiTxn] SharedTransaction committed successfully: label={}", sharedLabel);
         this.sharedLabel = null;
         this.database = null;
+        this.table = null;
     }
 
     public String getSharedLabel() {
@@ -136,15 +139,25 @@ public class SharedTransactionCoordinator {
     }
 
     /**
-     * Resets the coordinator state without committing. Used on error paths
-     * and savepoint interruption to abandon the in-progress shared transaction.
-     * The StarRocks-side transaction will be cleaned up by its timeout.
+     * Attempts to rollback the in-progress shared transaction, then resets state.
+     * Used on error paths and savepoint interruption. If rollback fails, the
+     * StarRocks-side transaction will be cleaned up by its timeout.
      */
     public void reset() {
         if (sharedLabel != null) {
-            LOG.warn("[MultiTxn] SharedTransactionCoordinator reset, abandoning label={}", sharedLabel);
+            LOG.warn("[MultiTxn] SharedTransactionCoordinator reset, attempting rollback for label={}", sharedLabel);
+            try {
+                StreamLoadSnapshot.Transaction txn =
+                        new StreamLoadSnapshot.Transaction(database, table, sharedLabel);
+                streamLoader.rollback(txn);
+                LOG.info("[MultiTxn] Rollback succeeded for label={}", sharedLabel);
+            } catch (Exception ex) {
+                LOG.warn("[MultiTxn] Rollback failed for label={}, will rely on server-side timeout",
+                        sharedLabel, ex);
+            }
         }
         this.sharedLabel = null;
         this.database = null;
+        this.table = null;
     }
 }

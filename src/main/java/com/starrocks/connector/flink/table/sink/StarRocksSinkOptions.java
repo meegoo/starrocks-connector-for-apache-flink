@@ -228,7 +228,7 @@ public class StarRocksSinkOptions implements Serializable {
         }
 
         for (StreamLoadTableProperties properties : tablePropertiesList) {
-            dbTables.add(Tuple2.of(properties.getDatabase(), getTableName()));
+            dbTables.add(Tuple2.of(properties.getDatabase(), properties.getTable()));
         }
 
         return new ArrayList<>(dbTables);

@@ -38,11 +38,13 @@ import org.slf4j.LoggerFactory;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -209,10 +211,8 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
                     if (savepoint) {
                         if (multiTableTransactionEnabled && txnCoordinator != null && txnCoordinator.isActive()) {
-                            LOG.warn("[MultiTxn] Savepoint interrupting in-flight shared transaction; waiting for in-flight loads");
-                            // Wait for any in-flight loads to complete before resetting,
-                            // otherwise loads may write data under the shared label without
-                            // a corresponding prepare+commit.
+                            LOG.info("[MultiTxn] Savepoint with active shared transaction; completing before savepoint");
+                            // Wait for any in-flight loads to complete
                             for (TransactionTableRegion region : flushQ) {
                                 Future<?> result = region.getResult();
                                 if (result != null) {
@@ -221,6 +221,40 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     } catch (Exception ignored) {
                                         // errors will be handled by the callback
                                     }
+                                }
+                            }
+                            // Trigger loads for regions with pending data that haven't loaded yet
+                            for (TransactionTableRegion region : flushQ) {
+                                region.triggerLoadIfNeeded();
+                            }
+                            // Wait for triggered loads to complete
+                            boolean allLoadsDone = false;
+                            while (!allLoadsDone) {
+                                allLoadsDone = true;
+                                for (TransactionTableRegion region : flushQ) {
+                                    if (region.isFlushing()) {
+                                        allLoadsDone = false;
+                                        break;
+                                    }
+                                }
+                                if (!allLoadsDone) {
+                                    LockSupport.parkNanos(1_000_000L);
+                                }
+                            }
+                            // Commit the shared transaction to avoid losing loaded data
+                            String anyTable = null;
+                            for (TransactionTableRegion region : flushQ) {
+                                if (anyTable == null) {
+                                    anyTable = region.getTable();
+                                }
+                            }
+                            if (anyTable != null) {
+                                try {
+                                    txnCoordinator.prepareAndCommit(anyTable);
+                                    LOG.info("[MultiTxn] Shared transaction committed during savepoint");
+                                } catch (Exception ex) {
+                                    LOG.error("[MultiTxn] Failed to commit shared transaction during savepoint", ex);
+                                    this.e = ex;
                                 }
                             }
                             txnCoordinator.reset();
@@ -370,11 +404,26 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
      * </ol>
      */
     private void processMultiTableCommit() {
+        // Take a snapshot of flushQ to ensure consistent iteration and avoid
+        // missing regions added concurrently by the task thread.
+        final List<TransactionTableRegion> regionSnapshot =
+                Collections.unmodifiableList(new ArrayList<>(flushQ));
         try {
             if (!txnCoordinator.isActive()) {
+                // Ensure no region is still flushing from a previous failed cycle
+                // (e.g. retrying a load). Starting a new shared transaction while a
+                // region retries would fail to inject the shared label.
+                for (TransactionTableRegion region : regionSnapshot) {
+                    if (region.isFlushing()) {
+                        LOG.debug("[MultiTxn] Region {} still flushing before begin, waiting",
+                                region.getUniqueKey());
+                        return;
+                    }
+                }
+
                 String anyDb = null;
                 String anyTable = null;
-                for (TransactionTableRegion region : flushQ) {
+                for (TransactionTableRegion region : regionSnapshot) {
                     if (anyDb == null) {
                         anyDb = region.getDatabase();
                         anyTable = region.getTable();
@@ -390,7 +439,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
                 txnCoordinator.begin(anyDb, anyTable);
 
-                for (TransactionTableRegion region : flushQ) {
+                for (TransactionTableRegion region : regionSnapshot) {
                     region.setLabel(txnCoordinator.getSharedLabel());
                     if (region.triggerLoadIfNeeded()) {
                         LOG.debug("[MultiTxn] triggered load for region={}", region.getUniqueKey());
@@ -398,7 +447,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 }
             }
 
-            for (TransactionTableRegion region : flushQ) {
+            for (TransactionTableRegion region : regionSnapshot) {
                 if (region.isFlushing()) {
                     LOG.debug("[MultiTxn] Region {} still flushing, will retry next scan",
                             region.getUniqueKey());
@@ -407,7 +456,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             }
 
             String anyTable = null;
-            for (TransactionTableRegion region : flushQ) {
+            for (TransactionTableRegion region : regionSnapshot) {
                 if (anyTable == null) {
                     anyTable = region.getTable();
                 }
@@ -417,7 +466,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 txnCoordinator.prepareAndCommit(anyTable);
             }
 
-            for (TransactionTableRegion region : flushQ) {
+            for (TransactionTableRegion region : regionSnapshot) {
                 region.setLabel(null);
                 region.resetAge();
             }
@@ -429,7 +478,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             txnCoordinator.reset();
             commitInFlight = false;
             partitionTracker.reset();
-            for (TransactionTableRegion region : flushQ) {
+            for (TransactionTableRegion region : regionSnapshot) {
                 region.setLabel(null);
             }
             this.e = ex;
@@ -752,7 +801,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     regions.put(uniqueKey, newRegion);
                     flushQ.offer(newRegion);
                     if (partition >= 0) {
-                        partitionRegions.computeIfAbsent(partition, k -> new ArrayList<>()).add(newRegion);
+                        partitionRegions.computeIfAbsent(partition, k -> new CopyOnWriteArrayList<>()).add(newRegion);
                     }
                     region = newRegion;
                 }
