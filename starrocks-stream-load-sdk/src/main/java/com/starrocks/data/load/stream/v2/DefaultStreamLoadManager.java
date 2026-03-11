@@ -105,7 +105,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     private volatile boolean allRegionsCommitted;
     private long flushTimeoutMs = 660000L; // default stream load timeout is 600s, 1.1x for flush
 
-    private volatile boolean commitInFlight = false;
+    private final AtomicBoolean commitInFlight = new AtomicBoolean(false);
 
     private final Lock lock = new ReentrantLock();
     private final Condition writable = lock.newCondition();
@@ -227,9 +227,12 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             for (TransactionTableRegion region : flushQ) {
                                 region.triggerLoadIfNeeded();
                             }
-                            // Wait for triggered loads to complete
+                            // Wait for triggered loads to complete.
+                            // Also exit early if a load error was recorded (this.e != null):
+                            // when a region exhausts retries, fail() sets this.e but leaves
+                            // the region in FLUSHING state, causing an infinite spin otherwise.
                             boolean allLoadsDone = false;
-                            while (!allLoadsDone) {
+                            while (!allLoadsDone && this.e == null) {
                                 allLoadsDone = true;
                                 for (TransactionTableRegion region : flushQ) {
                                     if (region.isFlushing()) {
@@ -237,18 +240,18 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                         break;
                                     }
                                 }
-                                if (!allLoadsDone) {
+                                if (!allLoadsDone && this.e == null) {
                                     LockSupport.parkNanos(1_000_000L);
                                 }
                             }
-                            // Commit the shared transaction to avoid losing loaded data
+                            // Only commit if all loads completed without error
                             String anyTable = null;
                             for (TransactionTableRegion region : flushQ) {
                                 if (anyTable == null) {
                                     anyTable = region.getTable();
                                 }
                             }
-                            if (anyTable != null) {
+                            if (allLoadsDone && anyTable != null) {
                                 try {
                                     txnCoordinator.prepareAndCommit(anyTable);
                                     LOG.info("[MultiTxn] Shared transaction committed during savepoint");
@@ -258,12 +261,16 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 }
                             }
                             txnCoordinator.reset();
-                            commitInFlight = false;
+                            commitInFlight.set(false);
                             if (partitionTracker != null) {
                                 partitionTracker.reset();
                             }
+                            // Skip setLabel(null) for regions that are actively retrying
+                            // (same policy as processMultiTableCommit's catch block).
                             for (TransactionTableRegion region : flushQ) {
-                                region.setLabel(null);
+                                if (!region.isRetrying()) {
+                                    region.setLabel(null);
+                                }
                             }
                         }
                         for (TransactionTableRegion region : flushQ) {
@@ -295,7 +302,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             }
                         }
                         LockSupport.unpark(current);
-                    } else if (commitInFlight) {
+                    } else if (commitInFlight.get()) {
                         // Multi-table coordinator-based commit (manager thread)
                         processMultiTableCommit();
                     } else {
@@ -379,8 +386,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     pRegions == null ? 0 : pRegions.size());
         }
 
-        if (partitionTracker.allSwitched() && !commitInFlight) {
-            commitInFlight = true;
+        // compareAndSet prevents a race where two concurrent trySwitchAndCommit() calls
+        // both see commitInFlight==false and both try to start a commit cycle.
+        if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
             lock.lock();
             try {
                 flushable.signal();
@@ -404,18 +412,18 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
      * </ol>
      */
     private void processMultiTableCommit() {
-        // Take a snapshot of flushQ to ensure consistent iteration and avoid
-        // missing regions added concurrently by the task thread.
+        // Snapshot flushQ for consistent iteration. Individual region states (labels,
+        // cache bytes) may change during iteration; this is handled by the state machine.
         final List<TransactionTableRegion> regionSnapshot =
                 Collections.unmodifiableList(new ArrayList<>(flushQ));
         try {
             if (!txnCoordinator.isActive()) {
-                // Ensure no region is still flushing from a previous failed cycle
-                // (e.g. retrying a load). Starting a new shared transaction while a
-                // region retries would fail to inject the shared label.
+                // Ensure no region is still flushing or retrying from a previous cycle.
+                // Starting a new shared transaction while a region retries would fail
+                // to inject the shared label (setLabel() throws if numRetries > 0).
                 for (TransactionTableRegion region : regionSnapshot) {
-                    if (region.isFlushing()) {
-                        LOG.debug("[MultiTxn] Region {} still flushing before begin, waiting",
+                    if (region.isFlushing() || region.isRetrying()) {
+                        LOG.debug("[MultiTxn] Region {} still flushing/retrying before begin, waiting",
                                 region.getUniqueKey());
                         return;
                     }
@@ -427,11 +435,16 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     if (anyDb == null) {
                         anyDb = region.getDatabase();
                         anyTable = region.getTable();
+                    } else if (!anyDb.equals(region.getDatabase())) {
+                        // Multi-table transactions require all regions to share the same database.
+                        throw new IllegalStateException(
+                                "All regions in a multi-table commit must share the same database. " +
+                                "Found databases: '" + anyDb + "' and '" + region.getDatabase() + "'");
                     }
                 }
 
                 if (anyDb == null) {
-                    commitInFlight = false;
+                    commitInFlight.set(false);
                     partitionTracker.reset();
                     LOG.info("[MultiTxn] No regions registered; commitInFlight=false");
                     return;
@@ -440,7 +453,19 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 txnCoordinator.begin(anyDb, anyTable);
 
                 for (TransactionTableRegion region : regionSnapshot) {
-                    region.setLabel(txnCoordinator.getSharedLabel());
+                    // setLabel() throws IllegalStateException if the region is retrying
+                    // (guarded by synchronized numRetries check). In that extremely narrow
+                    // race window (FLUSHING check passed but fail() was called just after),
+                    // catch and back off so the next scan retries from the begin phase.
+                    try {
+                        region.setLabel(txnCoordinator.getSharedLabel());
+                    } catch (IllegalStateException ex) {
+                        LOG.warn("[MultiTxn] Region {} started retrying between isFlushing check " +
+                                "and setLabel; rolling back and retrying next scan: {}",
+                                region.getUniqueKey(), ex.getMessage());
+                        txnCoordinator.reset();
+                        return;
+                    }
                     if (region.triggerLoadIfNeeded()) {
                         LOG.debug("[MultiTxn] triggered load for region={}", region.getUniqueKey());
                     }
@@ -470,16 +495,23 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 region.setLabel(null);
                 region.resetAge();
             }
-            commitInFlight = false;
+            commitInFlight.set(false);
             partitionTracker.reset();
             LOG.info("[MultiTxn] Shared transaction committed; commitInFlight=false");
         } catch (Exception ex) {
             LOG.error("[MultiTxn] Shared transaction commit failed", ex);
             txnCoordinator.reset();
-            commitInFlight = false;
+            commitInFlight.set(false);
             partitionTracker.reset();
+            // Only clear the label for regions that are NOT actively retrying.
+            // Clearing the label of a retrying region would cause its retry to start
+            // a new implicit transaction instead of re-using the shared label, leading
+            // to inconsistent state. The job is failing (this.e will be set) so the
+            // retrying region's outcome no longer matters for data integrity.
             for (TransactionTableRegion region : regionSnapshot) {
-                region.setLabel(null);
+                if (!region.isRetrying()) {
+                    region.setLabel(null);
+                }
             }
             this.e = ex;
         }
@@ -503,36 +535,45 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                         uniqueKey == null ? "null" : uniqueKey, database, table, row);
             }
             int bytes = region.write(row.getBytes(StandardCharsets.UTF_8));
-            long cachedBytes = currentCacheBytes.addAndGet(bytes);
-            if (cachedBytes >= maxWriteBlockCacheBytes) {
-                long startTime = System.nanoTime();
-                lock.lock();
-                try {
-                    int idx = 0;
-                    while (currentCacheBytes.get() >= maxWriteBlockCacheBytes) {
-                        checkAndThrowException();
-                        LOG.info("Cache full, wait flush, currentBytes: {}, maxWriteBlockCacheBytes: {}",
-                                currentCacheBytes.get(), maxWriteBlockCacheBytes);
-                        flushable.signal();
-                        writable.await(Math.min(++idx, 5), TimeUnit.SECONDS);
-                    }
-                } catch (InterruptedException ex) {
-                    this.e = ex;
-                    throw new RuntimeException(ex);
-                } finally {
-                    lock.unlock();
-                }
-                loadMetrics.updateWriteBlock(1, System.nanoTime() - startTime);
-            } else if (cachedBytes >= maxCacheBytes && writeTriggerFlush.compareAndSet(false, true)) {
-                lock.lock();
-                try {
+            blockIfCacheFull(currentCacheBytes.addAndGet(bytes));
+        }
+    }
+
+    /**
+     * Blocks the calling (task) thread if the write-side cache is full, and signals
+     * the manager thread to flush when the soft threshold is reached.
+     *
+     * <p>Extracted to avoid duplication between the two {@code write()} overloads.
+     */
+    private void blockIfCacheFull(long cachedBytes) {
+        if (cachedBytes >= maxWriteBlockCacheBytes) {
+            long startTime = System.nanoTime();
+            lock.lock();
+            try {
+                int idx = 0;
+                while (currentCacheBytes.get() >= maxWriteBlockCacheBytes) {
+                    checkAndThrowException();
+                    LOG.info("Cache full, wait flush, currentBytes: {}, maxWriteBlockCacheBytes: {}",
+                            currentCacheBytes.get(), maxWriteBlockCacheBytes);
                     flushable.signal();
-                } finally {
-                    lock.unlock();
+                    writable.await(Math.min(++idx, 5), TimeUnit.SECONDS);
                 }
-                loadMetrics.updateWriteTriggerFlush(1);
-                LOG.info("Trigger flush, currentBytes: {}, maxCacheBytes: {}", cachedBytes, maxCacheBytes);
+            } catch (InterruptedException ex) {
+                this.e = ex;
+                throw new RuntimeException(ex);
+            } finally {
+                lock.unlock();
             }
+            loadMetrics.updateWriteBlock(1, System.nanoTime() - startTime);
+        } else if (cachedBytes >= maxCacheBytes && writeTriggerFlush.compareAndSet(false, true)) {
+            lock.lock();
+            try {
+                flushable.signal();
+            } finally {
+                lock.unlock();
+            }
+            loadMetrics.updateWriteTriggerFlush(1);
+            LOG.info("Trigger flush, currentBytes: {}, maxCacheBytes: {}", cachedBytes, maxCacheBytes);
         }
     }
 
@@ -603,21 +644,28 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         long startTime = System.currentTimeMillis();
         long waitTime = 100; // Initial wait time: 100ms
 
-        while (!isSavepointFinished()) {
-            checkFlushTimeout(startTime);
+        try {
+            while (!isSavepointFinished()) {
+                checkFlushTimeout(startTime);
 
-            triggerFlushSignal();
-            LockSupport.park(current);
+                triggerFlushSignal();
+                LockSupport.park(current);
 
-            if (!savepoint) {
-                break;
+                if (!savepoint) {
+                    break;
+                }
+
+                waitForRegionResults(waitTime);
+                waitTime = calculateNextWaitTime(waitTime);
             }
 
-            waitForRegionResults(waitTime);
-            waitTime = calculateNextWaitTime(waitTime);
+            finishFlush();
+        } finally {
+            // Ensure the savepoint flag is always cleared even if checkFlushTimeout()
+            // or finishFlush() throw, so the manager thread does not keep acting on
+            // a stale savepoint signal after flush() has already returned.
+            savepoint = false;
         }
-
-        finishFlush();
     }
 
     private void initializeFlushState() {
@@ -745,35 +793,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         for (String row : rows) {
             checkAndThrowException();
             int bytes = region.write(row.getBytes(StandardCharsets.UTF_8));
-            long cachedBytes = currentCacheBytes.addAndGet(bytes);
-            if (cachedBytes >= maxWriteBlockCacheBytes) {
-                long startTime = System.nanoTime();
-                lock.lock();
-                try {
-                    int idx = 0;
-                    while (currentCacheBytes.get() >= maxWriteBlockCacheBytes) {
-                        checkAndThrowException();
-                        LOG.info("Cache full, wait flush, currentBytes: {}, maxWriteBlockCacheBytes: {}",
-                                currentCacheBytes.get(), maxWriteBlockCacheBytes);
-                        flushable.signal();
-                        writable.await(Math.min(++idx, 5), TimeUnit.SECONDS);
-                    }
-                } catch (InterruptedException ex) {
-                    this.e = ex;
-                    throw new RuntimeException(ex);
-                } finally {
-                    lock.unlock();
-                }
-                loadMetrics.updateWriteBlock(1, System.nanoTime() - startTime);
-            } else if (cachedBytes >= maxCacheBytes && writeTriggerFlush.compareAndSet(false, true)) {
-                lock.lock();
-                try {
-                    flushable.signal();
-                } finally {
-                    lock.unlock();
-                }
-                loadMetrics.updateWriteTriggerFlush(1);
-            }
+            blockIfCacheFull(currentCacheBytes.addAndGet(bytes));
         }
     }
 

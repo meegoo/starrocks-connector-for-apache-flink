@@ -81,8 +81,13 @@ public class PartitionCommitTracker {
     public synchronized boolean onTxnEnd(int partition) {
         PartitionState state = partitions.get(partition);
         if (state == null) {
-            LOG.warn("[MultiTxn] txnEnd for unknown partition {}, ignoring", partition);
-            return false;
+            // Partition was never registered or was evicted after being idle.
+            // Re-register it as TXN_END_RECEIVED so it participates correctly in the
+            // next commit cycle; the empty-chunk case is handled gracefully downstream.
+            LOG.info("[MultiTxn] txnEnd for unknown/evicted partition {}, re-registering", partition);
+            partitions.put(partition, PartitionState.TXN_END_RECEIVED);
+            idleCycleCount.remove(partition);
+            return isIntervalElapsed();
         }
         if (state == PartitionState.ACTIVE) {
             partitions.put(partition, PartitionState.TXN_END_RECEIVED);
@@ -128,7 +133,7 @@ public class PartitionCommitTracker {
         return true;
     }
 
-    public boolean isIntervalElapsed() {
+    private boolean isIntervalElapsed() {
         return System.currentTimeMillis() - lastCommitTimeMs >= commitIntervalMs;
     }
 

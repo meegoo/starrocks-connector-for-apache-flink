@@ -71,7 +71,7 @@ public class TransactionTableRegion implements TableRegion {
     private final AtomicLong cacheBytes = new AtomicLong();
     private final AtomicLong cacheRows = new AtomicLong();
     private final AtomicReference<State> state;
-    private final AtomicBoolean ctl = new AtomicBoolean(false);
+    private final AtomicBoolean writeLock = new AtomicBoolean(false);
     private final AtomicLong chunkIdGenerator = new AtomicLong(0);
     private volatile Chunk activeChunk;
     private final ConcurrentLinkedQueue<Chunk> inactiveChunks = new ConcurrentLinkedQueue<>();
@@ -165,8 +165,10 @@ public class TransactionTableRegion implements TableRegion {
     }
 
     @Override
-    public void setLabel(String label) {
-        // Reuse the same label to avoid duplicate load if retry happens
+    public synchronized void setLabel(String label) {
+        // Guard against injecting a new shared label while a retry is in progress.
+        // numRetries is mutated under this same monitor (see fail()), so the check
+        // and the assignment are now atomic with respect to concurrent fail() calls.
         if (numRetries > 0 && label != null) {
             LOG.warn("[MultiTxn] setLabel called with label={} while numRetries={}, "
                     + "existing label={}. Rejecting to preserve retry consistency.",
@@ -191,6 +193,11 @@ public class TransactionTableRegion implements TableRegion {
     /** Returns the current state as a string for logging purposes. */
     public String getStateForLog() {
         return state.get().name();
+    }
+
+    /** Returns {@code true} if the region is currently retrying a failed HTTP load. */
+    public synchronized boolean isRetrying() {
+        return numRetries > 0;
     }
 
     @Override
@@ -219,11 +226,11 @@ public class TransactionTableRegion implements TableRegion {
 
         int spins = 0;
         for (;;) {
-            if (ctl.compareAndSet(false, true)) {
+            if (writeLock.compareAndSet(false, true)) {
                 try {
                     return write0(row);
                 } finally {
-                    ctl.set(false);
+                    writeLock.set(false);
                 }
             }
             if (spins < MAX_SPIN_ATTEMPTS) {
@@ -254,11 +261,11 @@ public class TransactionTableRegion implements TableRegion {
     public void switchChunkForCommit() {
         int spins = 0;
         for (;;) {
-            if (ctl.compareAndSet(false, true)) {
+            if (writeLock.compareAndSet(false, true)) {
                 try {
                     switchChunk();
                 } finally {
-                    ctl.set(false);
+                    writeLock.set(false);
                 }
                 LOG.debug("[MultiTxn] switchChunkForCommit: db={}, table={}, inactiveChunks={}",
                         database, table, inactiveChunks.size());
@@ -329,14 +336,14 @@ public class TransactionTableRegion implements TableRegion {
         if (state.compareAndSet(State.ACTIVE, State.FLUSHING)) {
             int spins = 0;
             for (;;) {
-                if (ctl.compareAndSet(false, true)) {
+                if (writeLock.compareAndSet(false, true)) {
                     try {
                         if (reason != FlushReason.BUFFER_ROWS_REACH_LIMIT ||
                                 activeChunk.numRows() >= properties.getMaxBufferRows()) {
                             switchChunk();
                         }
                     } finally {
-                        ctl.set(false);
+                        writeLock.set(false);
                     }
                     break;
                 }
@@ -444,15 +451,18 @@ public class TransactionTableRegion implements TableRegion {
             firstException = e;
         }
 
-        if (numRetries >= maxRetries || !isRetryable(e)) {
-            LOG.error("Failed to flush data for db: {}, table: {} after {} times retry, the last exception is",
-                    database, table, numRetries, e);
-            manager.callback(firstException);
-            return;
+        // Synchronize on 'this' so that the numRetries increment is atomic with
+        // respect to the check in setLabel(), preventing label injection mid-retry.
+        synchronized (this) {
+            if (numRetries >= maxRetries || !isRetryable(e)) {
+                LOG.error("Failed to flush data for db: {}, table: {} after {} times retry, the last exception is",
+                        database, table, numRetries, e);
+                manager.callback(firstException);
+                return;
+            }
+            responseFuture = null;
+            numRetries += 1;
         }
-
-        responseFuture = null;
-        numRetries += 1;
         LOG.warn("Failed to flush data for db: {}, table: {}, and will retry for {} times after {} ms",
                 database, table, numRetries, retryIntervalInMs, e);
         streamLoad(retryIntervalInMs);
@@ -466,8 +476,10 @@ public class TransactionTableRegion implements TableRegion {
         response.setFlushBytes(chunk.rowBytes());
         response.setFlushRows(chunk.numRows());
         manager.callback(response);
-        numRetries = 0;
-        firstException = null;
+        synchronized (this) {
+            numRetries = 0;
+            firstException = null;
+        }
 
         if (!inactiveChunks.isEmpty()) {
             LOG.debug("Stream load continue, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",

@@ -100,10 +100,15 @@ public class StreamLoadManagerMultiTableTest {
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
 
-            Assert.assertTrue("Expected at least 1 begin call", mockedServer.getBeginCount() >= 1);
-            Assert.assertTrue("Expected at least 1 load call", mockedServer.getLoadCount() >= 1);
-            Assert.assertTrue("Expected at least 1 prepare call", mockedServer.getPrepareCount() >= 1);
-            Assert.assertTrue("Expected at least 1 commit call", mockedServer.getCommitCount() >= 1);
+            // Single shared transaction: exactly 1 begin and 1 prepare/commit sequence.
+            Assert.assertEquals("Expected exactly 1 begin for single shared transaction",
+                    1, mockedServer.getBeginCount());
+            Assert.assertTrue("Expected at least 1 load call (one per table)",
+                    mockedServer.getLoadCount() >= 1);
+            Assert.assertEquals("Expected exactly 1 prepare for single shared transaction",
+                    1, mockedServer.getPrepareCount());
+            Assert.assertEquals("Expected exactly 1 commit for single shared transaction",
+                    1, mockedServer.getCommitCount());
         } finally {
             manager.close();
         }
@@ -218,22 +223,115 @@ public class StreamLoadManagerMultiTableTest {
     }
 
     /**
-     * Savepoint (flush) works in multi-table mode.
+     * Savepoint (flush) commits the active shared transaction even when
+     * txnEnd has not been received (interval-based commit threshold is very high).
+     * Verifies exactly 1 begin + prepare + commit via the savepoint path.
      */
     @Test
     public void testSavepointCommitsMultiTableTransaction() throws Exception {
-        StreamLoadProperties properties = buildMultiTableProperties(60000);
+        StreamLoadProperties properties = buildMultiTableProperties(60000); // 60s interval — never fires
         StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
         manager.init();
 
         try {
+            mockedServer.resetCounters();
+
             manager.write(0, "test", "orders",
                     "{\"order_id\":1, \"customer_id\":100}");
             manager.write(0, "test", "order_items",
                     "{\"item_id\":1, \"order_id\":1}");
 
+            // setCommitAllowed(0, true) is NOT called — flush() must commit via savepoint path
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
+
+            // The savepoint path commits any active shared transaction.
+            // Exactly 1 begin/prepare/commit must be issued regardless of txnEnd.
+            Assert.assertEquals("Savepoint should issue exactly 1 begin",
+                    1, mockedServer.getBeginCount());
+            Assert.assertEquals("Savepoint should issue exactly 1 prepare",
+                    1, mockedServer.getPrepareCount());
+            Assert.assertEquals("Savepoint should issue exactly 1 commit",
+                    1, mockedServer.getCommitCount());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * An evicted (idle) partition that later receives txnEnd should be
+     * automatically re-registered and participate in the next commit cycle.
+     *
+     * <p>This tests the {@code onTxnEnd()} fix that re-registers evicted partitions
+     * instead of ignoring them.
+     */
+    @Test
+    public void testEvictedPartitionReRegisters() throws Exception {
+        // Very short interval (100 ms) to trigger multiple rapid commit cycles
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Commit cycle 1 — only partition 0
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // Commit cycle 2 — only partition 0 (partition 0 resets to ACTIVE)
+            manager.write(0, "test", "orders", "{\"order_id\":2}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // Commit cycle 3 — only partition 0 (3rd cycle: idle count reaches MAX_IDLE_CYCLES)
+            manager.write(0, "test", "orders", "{\"order_id\":3}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // After 3 idle commit cycles, partition 0 would be evicted.
+            // Now partition 0 sends txnEnd again — it must be re-registered, not ignored.
+            manager.write(0, "test", "orders", "{\"order_id\":4}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            manager.flush();
+            Assert.assertNull("No exception expected after evicted partition re-registers",
+                    manager.getException());
+
+            // At least 4 complete commit cycles must have occurred
+            Assert.assertTrue("Expected at least 4 commits across re-registration cycles",
+                    mockedServer.getCommitCount() >= 4);
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Regions from different databases must be rejected: multi-table transactions
+     * require all tables to share the same StarRocks database.
+     */
+    @Test
+    public void testCrossDbWriteIsRejected() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            // Write to two different databases in the same commit cycle
+            manager.write(0, "db_a", "orders", "{\"order_id\":1}");
+            manager.write(0, "db_b", "payments", "{\"payment_id\":1}");
+            manager.setCommitAllowed(0, true);
+
+            // Give manager thread time to attempt commit
+            Thread.sleep(500);
+
+            // Manager should have recorded an error about mismatched databases
+            Assert.assertNotNull("Expected exception for cross-database write",
+                    manager.getException());
+            Assert.assertTrue("Exception should mention database mismatch",
+                    manager.getException().getMessage().contains("same database"));
         } finally {
             manager.close();
         }
