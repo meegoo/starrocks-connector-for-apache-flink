@@ -100,10 +100,15 @@ public class StreamLoadManagerMultiTableTest {
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
 
-            Assert.assertTrue("Expected at least 1 begin call", mockedServer.getBeginCount() >= 1);
-            Assert.assertTrue("Expected at least 1 load call", mockedServer.getLoadCount() >= 1);
-            Assert.assertTrue("Expected at least 1 prepare call", mockedServer.getPrepareCount() >= 1);
-            Assert.assertTrue("Expected at least 1 commit call", mockedServer.getCommitCount() >= 1);
+            // Single shared transaction: exactly 1 begin and 1 prepare/commit sequence.
+            Assert.assertEquals("Expected exactly 1 begin for single shared transaction",
+                    1, mockedServer.getBeginCount());
+            Assert.assertTrue("Expected at least 1 load call (one per table)",
+                    mockedServer.getLoadCount() >= 1);
+            Assert.assertEquals("Expected exactly 1 prepare for single shared transaction",
+                    1, mockedServer.getPrepareCount());
+            Assert.assertEquals("Expected exactly 1 commit for single shared transaction",
+                    1, mockedServer.getCommitCount());
         } finally {
             manager.close();
         }
@@ -234,6 +239,35 @@ public class StreamLoadManagerMultiTableTest {
 
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Regions from different databases must be rejected: multi-table transactions
+     * require all tables to share the same StarRocks database.
+     */
+    @Test
+    public void testCrossDbWriteIsRejected() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            // Write to two different databases in the same commit cycle
+            manager.write(0, "db_a", "orders", "{\"order_id\":1}");
+            manager.write(0, "db_b", "payments", "{\"payment_id\":1}");
+            manager.setCommitAllowed(0, true);
+
+            // Give manager thread time to attempt commit
+            Thread.sleep(500);
+
+            // Manager should have recorded an error about mismatched databases
+            Assert.assertNotNull("Expected exception for cross-database write",
+                    manager.getException());
+            Assert.assertTrue("Exception should mention database mismatch",
+                    manager.getException().getMessage().contains("same database"));
         } finally {
             manager.close();
         }

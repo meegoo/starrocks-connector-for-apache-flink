@@ -195,6 +195,11 @@ public class TransactionTableRegion implements TableRegion {
         return state.get().name();
     }
 
+    /** Returns {@code true} if the region is currently retrying a failed HTTP load. */
+    public synchronized boolean isRetrying() {
+        return numRetries > 0;
+    }
+
     @Override
     public void resetAge() {
         age.set(0);

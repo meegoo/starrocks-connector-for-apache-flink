@@ -405,18 +405,18 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
      * </ol>
      */
     private void processMultiTableCommit() {
-        // Take a snapshot of flushQ to ensure consistent iteration and avoid
-        // missing regions added concurrently by the task thread.
+        // Snapshot flushQ for consistent iteration. Individual region states (labels,
+        // cache bytes) may change during iteration; this is handled by the state machine.
         final List<TransactionTableRegion> regionSnapshot =
                 Collections.unmodifiableList(new ArrayList<>(flushQ));
         try {
             if (!txnCoordinator.isActive()) {
-                // Ensure no region is still flushing from a previous failed cycle
-                // (e.g. retrying a load). Starting a new shared transaction while a
-                // region retries would fail to inject the shared label.
+                // Ensure no region is still flushing or retrying from a previous cycle.
+                // Starting a new shared transaction while a region retries would fail
+                // to inject the shared label (setLabel() throws if numRetries > 0).
                 for (TransactionTableRegion region : regionSnapshot) {
-                    if (region.isFlushing()) {
-                        LOG.debug("[MultiTxn] Region {} still flushing before begin, waiting",
+                    if (region.isFlushing() || region.isRetrying()) {
+                        LOG.debug("[MultiTxn] Region {} still flushing/retrying before begin, waiting",
                                 region.getUniqueKey());
                         return;
                     }
@@ -428,6 +428,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     if (anyDb == null) {
                         anyDb = region.getDatabase();
                         anyTable = region.getTable();
+                    } else if (!anyDb.equals(region.getDatabase())) {
+                        // Multi-table transactions require all regions to share the same database.
+                        throw new IllegalStateException(
+                                "All regions in a multi-table commit must share the same database. " +
+                                "Found databases: '" + anyDb + "' and '" + region.getDatabase() + "'");
                     }
                 }
 
@@ -441,7 +446,19 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 txnCoordinator.begin(anyDb, anyTable);
 
                 for (TransactionTableRegion region : regionSnapshot) {
-                    region.setLabel(txnCoordinator.getSharedLabel());
+                    // setLabel() throws IllegalStateException if the region is retrying
+                    // (guarded by synchronized numRetries check). In that extremely narrow
+                    // race window (FLUSHING check passed but fail() was called just after),
+                    // catch and back off so the next scan retries from the begin phase.
+                    try {
+                        region.setLabel(txnCoordinator.getSharedLabel());
+                    } catch (IllegalStateException ex) {
+                        LOG.warn("[MultiTxn] Region {} started retrying between isFlushing check " +
+                                "and setLabel; rolling back and retrying next scan: {}",
+                                region.getUniqueKey(), ex.getMessage());
+                        txnCoordinator.reset();
+                        return;
+                    }
                     if (region.triggerLoadIfNeeded()) {
                         LOG.debug("[MultiTxn] triggered load for region={}", region.getUniqueKey());
                     }
@@ -479,8 +496,15 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             txnCoordinator.reset();
             commitInFlight.set(false);
             partitionTracker.reset();
+            // Only clear the label for regions that are NOT actively retrying.
+            // Clearing the label of a retrying region would cause its retry to start
+            // a new implicit transaction instead of re-using the shared label, leading
+            // to inconsistent state. The job is failing (this.e will be set) so the
+            // retrying region's outcome no longer matters for data integrity.
             for (TransactionTableRegion region : regionSnapshot) {
-                region.setLabel(null);
+                if (!region.isRetrying()) {
+                    region.setLabel(null);
+                }
             }
             this.e = ex;
         }
