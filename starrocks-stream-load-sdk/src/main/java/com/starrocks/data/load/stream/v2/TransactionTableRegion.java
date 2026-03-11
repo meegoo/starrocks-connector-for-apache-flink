@@ -216,7 +216,7 @@ public class TransactionTableRegion implements TableRegion {
                     ctl.set(false);
                 }
             }
-            Thread.onSpinWait();
+            // yield to reduce CPU usage during spin
         }
     }
 
@@ -243,11 +243,11 @@ public class TransactionTableRegion implements TableRegion {
                 } finally {
                     ctl.set(false);
                 }
-                LOG.info("[MultiTxn] switchChunkForCommit: db={}, table={}, inactiveChunks={}",
+                LOG.debug("[MultiTxn] switchChunkForCommit: db={}, table={}, inactiveChunks={}",
                         database, table, inactiveChunks.size());
                 return;
             }
-            Thread.onSpinWait();
+            // yield to reduce CPU usage during spin
         }
     }
 
@@ -316,7 +316,7 @@ public class TransactionTableRegion implements TableRegion {
                     }
                     break;
                 }
-                Thread.onSpinWait();
+                // yield to reduce CPU usage during spin
             }
             if (!inactiveChunks.isEmpty()) {
                 LOG.debug("Flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",

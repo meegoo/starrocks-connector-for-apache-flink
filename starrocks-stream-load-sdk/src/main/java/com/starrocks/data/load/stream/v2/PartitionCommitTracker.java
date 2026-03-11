@@ -22,6 +22,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -98,7 +99,7 @@ public class PartitionCommitTracker {
      */
     public List<Integer> getReadyToSwitch() {
         if (!isIntervalElapsed()) {
-            return List.of();
+            return Collections.emptyList();
         }
         List<Integer> ready = new ArrayList<>();
         for (Map.Entry<Integer, PartitionState> entry : partitions.entrySet()) {

@@ -209,9 +209,25 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
                     if (savepoint) {
                         if (multiTableTransactionEnabled && txnCoordinator != null && txnCoordinator.isActive()) {
-                            LOG.warn("[MultiTxn] Savepoint interrupting in-flight shared transaction; resetting coordinator");
+                            LOG.warn("[MultiTxn] Savepoint interrupting in-flight shared transaction; waiting for in-flight loads");
+                            // Wait for any in-flight loads to complete before resetting,
+                            // otherwise loads may write data under the shared label without
+                            // a corresponding prepare+commit.
+                            for (TransactionTableRegion region : flushQ) {
+                                Future<?> result = region.getResult();
+                                if (result != null) {
+                                    try {
+                                        result.get();
+                                    } catch (Exception ignored) {
+                                        // errors will be handled by the callback
+                                    }
+                                }
+                            }
                             txnCoordinator.reset();
                             commitInFlight = false;
+                            if (partitionTracker != null) {
+                                partitionTracker.reset();
+                            }
                             for (TransactionTableRegion region : flushQ) {
                                 region.setLabel(null);
                             }
@@ -411,6 +427,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         } catch (Exception ex) {
             LOG.error("[MultiTxn] Shared transaction commit failed", ex);
             txnCoordinator.reset();
+            commitInFlight = false;
+            partitionTracker.reset();
+            for (TransactionTableRegion region : flushQ) {
+                region.setLabel(null);
+            }
             this.e = ex;
         }
     }
