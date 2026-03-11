@@ -540,7 +540,7 @@ public class StreamLoadProperties implements Serializable {
 
         public Builder oldThreshold(float oldThreshold) {
             if (oldThreshold <= 0 || oldThreshold > 1) {
-                throw new IllegalArgumentException("youngThreshold `" + oldThreshold + "` set failed, must range in (0, 1]");
+                throw new IllegalArgumentException("oldThreshold `" + oldThreshold + "` set failed, must range in (0, 1]");
             }
             this.oldThreshold = oldThreshold;
             return this;

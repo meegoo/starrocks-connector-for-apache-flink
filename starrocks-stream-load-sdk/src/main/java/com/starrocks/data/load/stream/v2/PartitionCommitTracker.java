@@ -52,6 +52,10 @@ public class PartitionCommitTracker {
     }
 
     private final Map<Integer, PartitionState> partitions = new LinkedHashMap<>();
+    /** Counts consecutive commit cycles where a partition stayed SWITCHED (idle). */
+    private final Map<Integer, Integer> idleCycleCount = new LinkedHashMap<>();
+    /** Remove a partition after this many consecutive idle commit cycles. */
+    private static final int MAX_IDLE_CYCLES = 3;
     private final long commitIntervalMs;
     private volatile long lastCommitTimeMs;
 
@@ -66,6 +70,7 @@ public class PartitionCommitTracker {
      */
     public synchronized void onWrite(int partition) {
         partitions.putIfAbsent(partition, PartitionState.ACTIVE);
+        idleCycleCount.remove(partition);
     }
 
     /**
@@ -136,12 +141,29 @@ public class PartitionCommitTracker {
      */
     public synchronized void reset() {
         lastCommitTimeMs = System.currentTimeMillis();
+
+        // Track idle cycles and evict partitions that have been idle too long
+        List<Integer> toRemove = new ArrayList<>();
         partitions.replaceAll((partition, state) -> {
             if (state == PartitionState.SWITCHED) {
+                int cycles = idleCycleCount.getOrDefault(partition, 0) + 1;
+                if (cycles >= MAX_IDLE_CYCLES) {
+                    toRemove.add(partition);
+                } else {
+                    idleCycleCount.put(partition, cycles);
+                }
                 return PartitionState.ACTIVE;
             }
             return state;
         });
+
+        for (Integer partition : toRemove) {
+            partitions.remove(partition);
+            idleCycleCount.remove(partition);
+            LOG.info("[MultiTxn] Evicted idle partition {} after {} consecutive idle cycles",
+                    partition, MAX_IDLE_CYCLES);
+        }
+
         LOG.info("[MultiTxn] PartitionCommitTracker reset, partitions: {}", partitions);
     }
 

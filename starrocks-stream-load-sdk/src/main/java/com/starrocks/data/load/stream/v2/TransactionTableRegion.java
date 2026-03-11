@@ -44,6 +44,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 import static com.starrocks.data.load.stream.exception.ErrorUtils.isRetryable;
 
@@ -207,12 +208,16 @@ public class TransactionTableRegion implements TableRegion {
         return age.get();
     }
 
+    private static final int MAX_SPIN_ATTEMPTS = 10;
+    private static final long SPIN_BACKOFF_NANOS = 1000L; // 1 microsecond initial backoff
+
     @Override
     public int write(byte[] row) {
         if (row == null) {
             return 0;
         }
 
+        int spins = 0;
         for (;;) {
             if (ctl.compareAndSet(false, true)) {
                 try {
@@ -221,7 +226,13 @@ public class TransactionTableRegion implements TableRegion {
                     ctl.set(false);
                 }
             }
-            Thread.yield();
+            if (spins < MAX_SPIN_ATTEMPTS) {
+                Thread.yield();
+                spins++;
+            } else {
+                LockSupport.parkNanos(SPIN_BACKOFF_NANOS * (spins - MAX_SPIN_ATTEMPTS + 1));
+                spins++;
+            }
         }
     }
 
@@ -241,6 +252,7 @@ public class TransactionTableRegion implements TableRegion {
      * so there is no concurrent {@link #write(byte[])} call.
      */
     public void switchChunkForCommit() {
+        int spins = 0;
         for (;;) {
             if (ctl.compareAndSet(false, true)) {
                 try {
@@ -252,7 +264,13 @@ public class TransactionTableRegion implements TableRegion {
                         database, table, inactiveChunks.size());
                 return;
             }
-            Thread.yield();
+            if (spins < MAX_SPIN_ATTEMPTS) {
+                Thread.yield();
+                spins++;
+            } else {
+                LockSupport.parkNanos(SPIN_BACKOFF_NANOS * (spins - MAX_SPIN_ATTEMPTS + 1));
+                spins++;
+            }
         }
     }
 
@@ -309,6 +327,7 @@ public class TransactionTableRegion implements TableRegion {
         LOG.debug("Try to flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
                 database, table, label, cacheBytes, cacheRows, reason);
         if (state.compareAndSet(State.ACTIVE, State.FLUSHING)) {
+            int spins = 0;
             for (;;) {
                 if (ctl.compareAndSet(false, true)) {
                     try {
@@ -321,7 +340,13 @@ public class TransactionTableRegion implements TableRegion {
                     }
                     break;
                 }
-                Thread.yield();
+                if (spins < MAX_SPIN_ATTEMPTS) {
+                    Thread.yield();
+                    spins++;
+                } else {
+                    LockSupport.parkNanos(SPIN_BACKOFF_NANOS * (spins - MAX_SPIN_ATTEMPTS + 1));
+                    spins++;
+                }
             }
             if (!inactiveChunks.isEmpty()) {
                 LOG.debug("Flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
@@ -466,12 +491,14 @@ public class TransactionTableRegion implements TableRegion {
             Chunk chunk = inactiveChunks.peek();
             if (chunk == null) {
                 LOG.warn("No inactive chunk available for stream load, db: {}, table: {}", database, table);
+                state.compareAndSet(State.FLUSHING, State.ACTIVE);
                 return;
             }
             LOG.debug("Stream load chunk, db: {}, table: {}, numRows: {}, rowBytes: {}, chunkBytes: {}",
                     database, table, chunk.numRows(), chunk.rowBytes(), chunk.chunkBytes());
             responseFuture = streamLoader.send(this, delayMs);
         } catch (Exception e) {
+            state.compareAndSet(State.FLUSHING, State.ACTIVE);
             fail(e);
         }
     }
