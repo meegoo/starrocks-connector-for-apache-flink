@@ -223,6 +223,15 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     }
                                 }
                             }
+                            // Switch ALL regions' active chunks into inactive queues so
+                            // that any residual data (e.g. from partitions that never
+                            // reached txnEnd) is included in the shared transaction.
+                            // Without this, the subsequent single-table flush path would
+                            // open independent transactions for the leftover data,
+                            // violating multi-table atomicity.
+                            for (TransactionTableRegion region : flushQ) {
+                                region.switchChunkForCommit();
+                            }
                             // Trigger loads for regions with pending data that haven't loaded yet
                             for (TransactionTableRegion region : flushQ) {
                                 region.triggerLoadIfNeeded();
@@ -255,6 +264,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 try {
                                     txnCoordinator.prepareAndCommit(anyTable);
                                     LOG.info("[MultiTxn] Shared transaction committed during savepoint");
+                                    allRegionsCommitted = true;
                                 } catch (Exception ex) {
                                     LOG.error("[MultiTxn] Failed to commit shared transaction during savepoint", ex);
                                     this.e = ex;
@@ -272,33 +282,38 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     region.setLabel(null);
                                 }
                             }
-                        }
-                        for (TransactionTableRegion region : flushQ) {
-                            boolean flush = region.flush(FlushReason.FORCE);
-                            LOG.debug("Trigger flush table region {} because of savepoint, region cache bytes: {}, flush: {}",
-                                    region.getUniqueKey(), region.getCacheBytes(), flush);
-                        }
-
-                        // should ensure all data is committed for auto-commit mode
-                        if (enableAutoCommit) {
-                            int committedRegions = 0;
+                        } else {
+                            // Non-multi-table path: flush and commit each region independently.
+                            // This block must NOT run after a multi-table savepoint commit,
+                            // because it would open new independent transactions for any
+                            // residual data, breaking the atomicity guarantee.
                             for (TransactionTableRegion region : flushQ) {
-                                // savepoint makes sure no more data is written, so these conditions
-                                // can guarantee commit after all data has been written to StarRocks
-                                boolean success = region.commit();
-                                if (success && region.getCacheBytes() == 0) {
-                                    committedRegions += 1;
-                                    region.resetAge();
-                                }
-                                LOG.debug("Commit region {} for savepoint, success: {}", region.getUniqueKey(), success);
+                                boolean flush = region.flush(FlushReason.FORCE);
+                                LOG.debug("Trigger flush table region {} because of savepoint, region cache bytes: {}, flush: {}",
+                                        region.getUniqueKey(), region.getCacheBytes(), flush);
                             }
 
-                            if (committedRegions == flushQ.size()) {
-                                allRegionsCommitted = true;
-                                LOG.info("All regions committed for savepoint, number of regions: {}", committedRegions);
-                            } else {
-                                LOG.debug("Some regions not committed for savepoint, expected num: {}, actual num: {}",
-                                        flushQ.size(), committedRegions);
+                            // should ensure all data is committed for auto-commit mode
+                            if (enableAutoCommit) {
+                                int committedRegions = 0;
+                                for (TransactionTableRegion region : flushQ) {
+                                    // savepoint makes sure no more data is written, so these conditions
+                                    // can guarantee commit after all data has been written to StarRocks
+                                    boolean success = region.commit();
+                                    if (success && region.getCacheBytes() == 0) {
+                                        committedRegions += 1;
+                                        region.resetAge();
+                                    }
+                                    LOG.debug("Commit region {} for savepoint, success: {}", region.getUniqueKey(), success);
+                                }
+
+                                if (committedRegions == flushQ.size()) {
+                                    allRegionsCommitted = true;
+                                    LOG.info("All regions committed for savepoint, number of regions: {}", committedRegions);
+                                } else {
+                                    LOG.debug("Some regions not committed for savepoint, expected num: {}, actual num: {}",
+                                            flushQ.size(), committedRegions);
+                                }
                             }
                         }
                         LockSupport.unpark(current);
@@ -332,16 +347,19 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 LOG.error("StarRocks-Sink-Manager error", ee);
                 e = ee;
             });
-            manager.start();
-            LOG.info("StarRocks-Sink-Manager start, enableAutoCommit: {}, streamLoader: {}, {}",
-                    enableAutoCommit, streamLoader.getClass().getName(), EnvUtils.getGitInformation());
-
             streamLoader.start(properties, this);
 
             if (multiTableTransactionEnabled) {
                 this.txnCoordinator = new SharedTransactionCoordinator(streamLoader, labelGeneratorFactory);
                 LOG.info("[MultiTxn] Multi-table transaction mode enabled");
             }
+
+            // Start the manager thread AFTER streamLoader and txnCoordinator
+            // are fully initialized, so the thread has guaranteed visibility
+            // of these fields (Thread.start() provides happens-before).
+            manager.start();
+            LOG.info("StarRocks-Sink-Manager start, enableAutoCommit: {}, streamLoader: {}, {}",
+                    enableAutoCommit, streamLoader.getClass().getName(), EnvUtils.getGitInformation());
         }
     }
 
