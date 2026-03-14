@@ -69,12 +69,53 @@ mvn test -Dtest=StarRocksSinkOptionsTest,MergeCommitOptionsTest,StarRocksSourceO
 
 ### 3.2 集成测试（依赖 StarRocks）
 
-集成测试基类 `StarRocksITTestBase` 会尝试启动 `StarRocksTestEnvironment` 容器；若失败，IT 可跳过。
+集成测试基类 `StarRocksITTestBase` 支持两种模式：
+
+1. **Testcontainers 模式**：自动启动 StarRocks 容器（需 Docker）
+2. **外部集群模式**：通过环境变量或系统属性指定 TSP 等外部集群，避免连接失败
+
+#### 外部集群配置（TSP / 手动部署）
+
+当 `SR_HTTP_URLS` 和 `SR_JDBC_URLS` 已设置时，**跳过 Testcontainers**，直接连接外部 StarRocks：
+
+| 环境变量 | 系统属性（备选） | 说明 |
+|----------|------------------|------|
+| `SR_HTTP_URLS` | `it.starrocks.http-urls` | FE HTTP 地址，如 `fe_host:8030` |
+| `SR_JDBC_URLS` | `it.starrocks.jdbc-urls` | JDBC URL，如 `jdbc:mysql://fe_host:9030` |
+| `SR_USERNAME` | `it.starrocks.username` | 用户名（默认 `root`） |
+| `SR_PASSWORD` | `it.starrocks.password` | 密码（默认空） |
+
+**TSP 集群示例**（TSP 脚本位于主 StarRocks 仓库 `AGENTS.md`，或从 TSP 控制台获取集群地址）：
+
+```bash
+# 1. 申请并等待集群（在主 StarRocks 仓库中执行）
+# ./tools/tsp_quick_apply.sh --apply-from 7011
+# ./tools/tsp_quick_apply.sh --wait-ready <cluster_name> 900
+# ./tools/tsp_quick_apply.sh --get-address <cluster_name>
+# 输出: SR_FE=fe_host:9030  → HTTP 用 fe_host:8030，JDBC 用 jdbc:mysql://fe_host:9030
+
+# 2. 在 Flink Connector 仓库中导出环境变量并运行 IT
+export SR_HTTP_URLS="<fe_host>:8030"
+export SR_JDBC_URLS="jdbc:mysql://<fe_host>:9030"
+export SR_USERNAME="root"
+export SR_PASSWORD=""
+mvn test -Dtest=StarRocksSinkITTest -DskipTests=false
+```
+
+#### Testcontainers 模式（需 Docker）
 
 | 系统属性 | 说明 |
 |----------|------|
 | `it.starrocks.image` | StarRocks 镜像，默认 `starrocks/allin1-ubuntu:3.5.5` |
 | `it.starrocks.platform` | 例如 Apple Silicon：`linux/arm64` |
+
+**当 Docker 需 sudo 时**：以 root 运行 Maven 以便访问 Docker socket：
+
+```bash
+sudo -E mvn test -Dtest=StarRocksSinkITTest -DskipTests=false
+```
+
+`-E` 保留当前环境变量。或用 `sudo env "PATH=$PATH" mvn test ...`。
 
 运行 IT 示例：
 
@@ -86,7 +127,7 @@ mvn test -Dtest=StarRocksSinkITTest -DskipTests=false
 mvn test -Dtest=StarRocksSinkITTest -Dit.starrocks.platform=linux/arm64 -DskipTests=false
 ```
 
-IT 需要 Docker 和足够内存（约 8 分钟启动超时）。无容器环境时，IT 会因启动失败而跳过。
+IT 需要 Docker 和足够内存（约 8 分钟启动超时）。无容器且未配置外部集群时，IT 会因连接失败而跳过。
 
 ### 3.3 Stream Load SDK 测试
 
@@ -157,6 +198,8 @@ PASSWORD = "";
 | 现象 | 处理建议 |
 |------|----------|
 | IT 启动超时 | 检查 Docker 是否运行、镜像拉取是否正常；可尝试 `-Dit.starrocks.image=starrocks/allin1-ubuntu:3.5.5` |
+| Docker 需 sudo | 使用 `sudo -E mvn test ...` 以 root 访问 Docker socket；或配置 `SR_HTTP_URLS`/`SR_JDBC_URLS` 使用 TSP 外部集群 |
+| IT 连接失败 | 设置 `SR_HTTP_URLS` 和 `SR_JDBC_URLS` 指向 TSP 申请集群，修改默认配置避免连接 127.0.0.1 |
 | JMockit 报错 | 确认 `maven-surefire-plugin` 的 `argLine` 中包含 `-javaagent:.../jmockit-*.jar` |
 | SDK 依赖缺失 | 先执行 `cd starrocks-stream-load-sdk && mvn clean install` |
 | 端口冲突 | Sink 相关单测会绑定动态端口；IT 使用固定端口 8030、9030、8040 等，避免本机其他服务占用 |
