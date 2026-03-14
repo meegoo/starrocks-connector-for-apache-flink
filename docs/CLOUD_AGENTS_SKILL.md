@@ -206,7 +206,109 @@ PASSWORD = "";
 
 ---
 
-## 7. 如何更新本技能文档
+## 7. 远程机器 + TSP 集群 + Docker 运行集成测试（完整流程）
+
+当本地 Cloud VM 无 Docker 或 JDK 8 时，可在**远程编译节点**上通过 **TSP 申请集群** + **Docker 容器（JDK 8）** 运行集成测试，确保流程可复现。
+
+### 7.1 环境变量（必须提前设置）
+
+| 变量 | 说明 |
+|------|------|
+| `SSH_HOST` | 远程机器 IP |
+| `SSH_USERNAME` | 远程 SSH 用户名 |
+| `SSH_PASSWORD` | 远程 SSH 密码 |
+| `TSP_HOST` | TSP 服务地址（申请集群用） |
+| `TSP_USERNAME` | TSP 登录账号 |
+| `TSP_PASSWORD` | TSP 登录密码 |
+
+依赖：`sshpass`（用于非交互式 SSH 传密）。
+
+### 7.2 远程目录与仓库约定
+
+| 路径 | 说明 |
+|------|------|
+| `/home/disk4/hujie/src/starrocks` | 主 StarRocks 仓库（含 TSP 脚本） |
+| `/home/disk4/hujie/src/starrocks-connector-for-apache-flink` | Flink Connector 仓库 |
+| `/home/disk4/hujie/.m2` | Maven 本地仓库（可跨构建复用） |
+
+### 7.3 步骤 1：申请 TSP 集群
+
+TSP 脚本位于主 StarRocks 仓库的 `meegoo/starrocks-cluster-quick-apply-b107` 分支：
+
+```bash
+REMOTE_SSH="sshpass -p \"\$SSH_PASSWORD\" ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=30 \$SSH_USERNAME@\$SSH_HOST"
+
+$REMOTE_SSH "cd /home/disk4/hujie/src/starrocks && git fetch origin && git checkout meegoo/starrocks-cluster-quick-apply-b107 2>/dev/null || true"
+
+# 申请集群（示例 7011 对应 hujietest1-4u-benchmark）
+$REMOTE_SSH "export TSP_HOST='$TSP_HOST'; export TSP_USERNAME='$TSP_USERNAME'; export TSP_PASSWORD='$TSP_PASSWORD'; cd /home/disk4/hujie/src/starrocks && ./tools/tsp_quick_apply.sh --apply-from 7011"
+# 输出示例: 新集群名称: hujietest1-4u-benchmark-03141430
+
+# 获取 FE 地址
+$REMOTE_SSH "export TSP_HOST='$TSP_HOST'; export TSP_USERNAME='$TSP_USERNAME'; export TSP_PASSWORD='$TSP_PASSWORD'; cd /home/disk4/hujie/src/starrocks && ./tools/tsp_quick_apply.sh --get-address <cluster_name>"
+# 输出示例: SR_FE=172.26.95.231:9030
+# 则 HTTP 地址为 172.26.95.231:8030，JDBC 为 jdbc:mysql://172.26.95.231:9030
+```
+
+集群申请后需等待状态为 Running；若脚本支持 `--wait-ready`，可先等待再获取地址。
+
+### 7.4 步骤 2：拉取 Connector 最新代码
+
+```bash
+$REMOTE_SSH "cd /home/disk4/hujie/src/starrocks-connector-for-apache-flink && git fetch origin && git checkout <branch> && git pull origin <branch>"
+```
+
+### 7.5 步骤 3：在 Docker（JDK 8）中运行集成测试
+
+远程节点可能只有 JDK 11/17，无 JDK 8。使用 `maven:3.8-eclipse-temurin-8` 镜像提供 JDK 8 环境，并将 `SR_HTTP_URLS`、`SR_JDBC_URLS` 传入容器：
+
+```bash
+FE_HOST="172.26.95.231"   # 从步骤 1 获取的实际 FE 地址
+
+$REMOTE_SSH "sudo docker run --rm \
+  -v /home/disk4/hujie/src/starrocks-connector-for-apache-flink:/workspace \
+  -v /home/disk4/hujie/.m2:/root/.m2 \
+  -e SR_HTTP_URLS=\"${FE_HOST}:8030\" \
+  -e SR_JDBC_URLS=\"jdbc:mysql://${FE_HOST}:9030\" \
+  -w /workspace \
+  maven:3.8-eclipse-temurin-8 \
+  bash -c 'cd starrocks-stream-load-sdk && mvn -q -B install -Dmaven.javadoc.skip=true && cd .. && mvn -q -B test -DskipTests=false'"
+```
+
+若 FE 地址需动态获取，可先执行 `--get-address` 解析输出，再代入上述命令。
+
+### 7.6 一键脚本示例（伪代码，需替换变量）
+
+```bash
+# 1. 申请集群并获取地址
+CLUSTER_NAME=$($REMOTE_SSH "export TSP_HOST=... TSP_USERNAME=... TSP_PASSWORD=...; cd /home/disk4/hujie/src/starrocks && ./tools/tsp_quick_apply.sh --apply-from 7011" | grep "新集群名称" | awk '{print $NF}')
+SR_FE=$($REMOTE_SSH "export TSP_HOST=...; cd /home/disk4/hujie/src/starrocks && ./tools/tsp_quick_apply.sh --get-address $CLUSTER_NAME" | grep SR_FE | cut -d= -f2)
+FE_HOST="${SR_FE%:*}"
+
+# 2. 拉取 Connector 代码
+$REMOTE_SSH "cd /home/disk4/hujie/src/starrocks-connector-for-apache-flink && git pull origin \$(git branch --show-current)"
+
+# 3. Docker 运行集成测试
+$REMOTE_SSH "sudo docker run --rm \
+  -v /home/disk4/hujie/src/starrocks-connector-for-apache-flink:/workspace \
+  -v /home/disk4/hujie/.m2:/root/.m2 \
+  -e SR_HTTP_URLS=\"${FE_HOST}:8030\" \
+  -e SR_JDBC_URLS=\"jdbc:mysql://${FE_HOST}:9030\" \
+  -w /workspace \
+  maven:3.8-eclipse-temurin-8 \
+  bash -c 'cd starrocks-stream-load-sdk && mvn -q -B install -Dmaven.javadoc.skip=true && cd .. && mvn -q -B test -DskipTests=false'"
+```
+
+### 7.7 关键要点
+
+- **JDK 8**：Connector 与 Arrow 在 JDK 17+ 上存在反射兼容问题，必须用 JDK 8 运行集成测试。
+- **Docker 镜像**：`maven:3.8-eclipse-temurin-8` 内置 JDK 8 与 Maven，首次使用需 `docker pull`。
+- **外部集群**：设置 `SR_HTTP_URLS`、`SR_JDBC_URLS` 后，IT 跳过 Testcontainers，直接连接 TSP 集群。
+- **sudo**：远程 Docker 若需 root，使用 `sudo docker run`。
+
+---
+
+## 8. 如何更新本技能文档
 
 当发现新的运行或测试技巧时，按以下方式更新本文件：
 
