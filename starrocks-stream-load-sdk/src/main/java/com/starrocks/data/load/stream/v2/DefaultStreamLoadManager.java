@@ -347,16 +347,19 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 LOG.error("StarRocks-Sink-Manager error", ee);
                 e = ee;
             });
-            manager.start();
-            LOG.info("StarRocks-Sink-Manager start, enableAutoCommit: {}, streamLoader: {}, {}",
-                    enableAutoCommit, streamLoader.getClass().getName(), EnvUtils.getGitInformation());
-
             streamLoader.start(properties, this);
 
             if (multiTableTransactionEnabled) {
                 this.txnCoordinator = new SharedTransactionCoordinator(streamLoader, labelGeneratorFactory);
                 LOG.info("[MultiTxn] Multi-table transaction mode enabled");
             }
+
+            // Start the manager thread AFTER streamLoader and txnCoordinator
+            // are fully initialized, so the thread has guaranteed visibility
+            // of these fields (Thread.start() provides happens-before).
+            manager.start();
+            LOG.info("StarRocks-Sink-Manager start, enableAutoCommit: {}, streamLoader: {}, {}",
+                    enableAutoCommit, streamLoader.getClass().getName(), EnvUtils.getGitInformation());
         }
     }
 
