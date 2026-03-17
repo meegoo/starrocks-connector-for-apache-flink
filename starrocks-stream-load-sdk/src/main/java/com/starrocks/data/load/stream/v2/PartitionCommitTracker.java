@@ -60,6 +60,13 @@ public class PartitionCommitTracker {
      * is not lost for the next commit cycle.
      */
     private final Set<Integer> pendingTxnEnd = new HashSet<>();
+    /**
+     * Tracks partitions that received new writes while SWITCHED. These partitions
+     * must NOT be removed during {@link #reset()} and must NOT transition to ACTIVE
+     * during the commit cycle (to prevent a second switch that would mix next-
+     * transaction data into the current shared label).
+     */
+    private final Set<Integer> pendingWrites = new HashSet<>();
     private final long commitIntervalMs;
     private volatile long lastCommitTimeMs;
 
@@ -69,12 +76,25 @@ public class PartitionCommitTracker {
     }
 
     /**
-     * Called when data is written for a partition. Always (re-)sets the partition to
-     * ACTIVE. This is critical when a partition that was TXN_END_RECEIVED or SWITCHED
-     * receives data from a new source transaction — the state must be reset so the
-     * new data is not prematurely included in the current commit cycle.
+     * Called when data is written for a partition.
+     *
+     * <p>If the partition is SWITCHED (commit in flight), the state is NOT changed
+     * to ACTIVE. Doing so would allow a subsequent {@code onTxnEnd} → {@code
+     * getReadyToSwitch} → {@code switchChunkForCommit} sequence within the same
+     * commit cycle, which would mix next-transaction data into the current shared
+     * label. Instead, writes accumulate in the region's active chunk; the partition
+     * is recorded in {@link #pendingWrites} so {@link #reset()} retains it as ACTIVE.
+     *
+     * <p>For all other states (null, ACTIVE, TXN_END_RECEIVED), the partition is
+     * (re-)set to ACTIVE so the new transaction data is tracked correctly.
      */
     public synchronized void onWrite(int partition) {
+        PartitionState current = partitions.get(partition);
+        if (current == PartitionState.SWITCHED) {
+            pendingWrites.add(partition);
+            LOG.debug("[MultiTxn] onWrite for SWITCHED partition {}, deferring to next cycle", partition);
+            return;
+        }
         partitions.put(partition, PartitionState.ACTIVE);
         pendingTxnEnd.remove(partition);
     }
@@ -99,7 +119,9 @@ public class PartitionCommitTracker {
         } else if (state == PartitionState.SWITCHED) {
             // Partition is currently in an in-flight commit cycle. Record the txnEnd
             // so reset() can promote it to TXN_END_RECEIVED for the next cycle,
-            // preventing the boundary from being lost.
+            // preventing the boundary from being lost. If the partition also has
+            // pendingWrites, the combined effect in reset() is TXN_END_RECEIVED
+            // (the next transaction's data + boundary are both ready).
             pendingTxnEnd.add(partition);
             LOG.debug("[MultiTxn] txnEnd for SWITCHED partition {}, recorded as pending", partition);
         }
@@ -151,33 +173,42 @@ public class PartitionCommitTracker {
     /**
      * Resets state after a successful commit.
      *
-     * <p>SWITCHED partitions that received new data during the commit phase will
-     * already have been moved to ACTIVE by {@link #onWrite}, so they are retained.
-     * Remaining SWITCHED partitions (idle — no new data arrived) are removed from
-     * tracking entirely. If they produce data later, {@link #onWrite} will re-register
-     * them. This prevents idle partitions from permanently blocking
-     * {@link #allSwitched()}.
+     * <p>For each SWITCHED partition, the outcome depends on what happened during
+     * the commit phase:
+     * <ul>
+     *   <li>Both {@code pendingWrites} and {@code pendingTxnEnd} → TXN_END_RECEIVED
+     *       (next transaction's data and boundary are both ready)</li>
+     *   <li>Only {@code pendingWrites} → ACTIVE (has data, awaiting txnEnd)</li>
+     *   <li>Only {@code pendingTxnEnd} → TXN_END_RECEIVED (boundary arrived, may
+     *       have empty data which is handled gracefully downstream)</li>
+     *   <li>Neither → removed from tracking (idle partition; will be re-registered
+     *       by {@link #onWrite} if it produces data later)</li>
+     * </ul>
      *
-     * <p>Partitions that received a txnEnd while SWITCHED (recorded in
-     * {@link #pendingTxnEnd}) are promoted to TXN_END_RECEIVED so the boundary
-     * is preserved for the next commit cycle.
+     * <p>This prevents idle partitions from permanently blocking
+     * {@link #allSwitched()}.
      */
     public synchronized void reset() {
         lastCommitTimeMs = System.currentTimeMillis();
 
-        // Remove idle SWITCHED partitions (those that received no new data during
-        // the commit phase). Partitions that got new writes are already ACTIVE.
         List<Integer> toRemove = new ArrayList<>();
         for (Map.Entry<Integer, PartitionState> entry : partitions.entrySet()) {
             if (entry.getValue() == PartitionState.SWITCHED) {
                 int partition = entry.getKey();
-                if (pendingTxnEnd.contains(partition)) {
-                    // A txnEnd arrived while SWITCHED — promote to TXN_END_RECEIVED
-                    // so the next commit cycle picks it up immediately.
+                boolean hasPendingWrites = pendingWrites.contains(partition);
+                boolean hasPendingTxnEnd = pendingTxnEnd.contains(partition);
+
+                if (hasPendingTxnEnd) {
+                    // txnEnd arrived (possibly with writes) — promote to TXN_END_RECEIVED
                     entry.setValue(PartitionState.TXN_END_RECEIVED);
-                    LOG.debug("[MultiTxn] Promoted partition {} to TXN_END_RECEIVED from pending txnEnd",
-                            partition);
+                    LOG.debug("[MultiTxn] Promoted partition {} to TXN_END_RECEIVED from pending " +
+                            "(writes={}, txnEnd={})", partition, hasPendingWrites, hasPendingTxnEnd);
+                } else if (hasPendingWrites) {
+                    // Only writes, no txnEnd — partition has next-transaction data, awaiting boundary
+                    entry.setValue(PartitionState.ACTIVE);
+                    LOG.debug("[MultiTxn] Reset partition {} to ACTIVE from pending writes", partition);
                 } else {
+                    // Idle — no data or boundary arrived during commit
                     toRemove.add(partition);
                 }
             }
@@ -188,6 +219,7 @@ public class PartitionCommitTracker {
             LOG.debug("[MultiTxn] Removed idle SWITCHED partition {} from tracking", partition);
         }
 
+        pendingWrites.clear();
         pendingTxnEnd.clear();
         LOG.info("[MultiTxn] PartitionCommitTracker reset, partitions: {}", partitions);
     }
