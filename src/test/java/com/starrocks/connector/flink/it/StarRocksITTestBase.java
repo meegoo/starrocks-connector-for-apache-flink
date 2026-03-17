@@ -47,6 +47,16 @@ public abstract class StarRocksITTestBase {
 
     private static final boolean DEBUG_MODE = false;
 
+    // System properties for specifying an external StarRocks cluster:
+    //   -Dit.starrocks.fe.http=<host>:<port>   e.g. 172.26.95.228:8030
+    //   -Dit.starrocks.fe.jdbc=jdbc:mysql://<host>:<port>  e.g. jdbc:mysql://172.26.95.228:9030
+    //   -Dit.starrocks.username=root
+    //   -Dit.starrocks.password=
+    private static final String PROP_FE_HTTP = "it.starrocks.fe.http";
+    private static final String PROP_FE_JDBC = "it.starrocks.fe.jdbc";
+    private static final String PROP_USERNAME = "it.starrocks.username";
+    private static final String PROP_PASSWORD = "it.starrocks.password";
+
     @Rule
     public TemporaryFolder temporaryFolder = new TemporaryFolder();
 
@@ -60,7 +70,17 @@ public abstract class StarRocksITTestBase {
 
     @BeforeClass
     public static void setUp() throws Exception {
-        if (!DEBUG_MODE) {
+        String extFeHttp = System.getProperty(PROP_FE_HTTP);
+        String extFeJdbc = System.getProperty(PROP_FE_JDBC);
+        if (extFeHttp != null && !extFeHttp.isEmpty()
+                && extFeJdbc != null && !extFeJdbc.isEmpty()) {
+            // Use the externally provided StarRocks cluster directly
+            HTTP_URLS = extFeHttp;
+            JDBC_URLS = extFeJdbc;
+            USERNAME = System.getProperty(PROP_USERNAME, "root");
+            PASSWORD = System.getProperty(PROP_PASSWORD, "");
+            LOG.info("Using external StarRocks cluster: http={}, jdbc={}", HTTP_URLS, JDBC_URLS);
+        } else if (!DEBUG_MODE) {
             try {
                 StarRocksTestEnvironment env = StarRocksTestEnvironment.getInstance();
                 env.startIfNeeded();

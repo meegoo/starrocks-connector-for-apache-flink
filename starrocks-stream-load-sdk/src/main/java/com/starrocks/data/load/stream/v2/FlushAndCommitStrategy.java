@@ -46,12 +46,17 @@ public class FlushAndCommitStrategy implements StreamLoadStrategy {
     private final AtomicLong numCacheTriggerFlush = new AtomicLong(0);
     private final AtomicLong numTableTriggerFlush = new AtomicLong(0);
 
+    private final boolean multiTableTransactionEnabled;
+
     public FlushAndCommitStrategy(StreamLoadProperties properties, boolean enableAutoCommit) {
         this.expectDelayTime = properties.getExpectDelayTime();
         this.scanFrequency = properties.getScanningFrequency();
+        // Integer division: commit may trigger slightly earlier than expectDelayTime
+        // when expectDelayTime is not evenly divisible by scanFrequency
         this.ageThreshold = expectDelayTime / scanFrequency;
         this.maxCacheBytes = properties.getMaxCacheBytes();
         this.enableAutoCommit = enableAutoCommit;
+        this.multiTableTransactionEnabled = properties.isEnableMultiTableTransaction();
 
         LOG.info("{}", this);
     }
@@ -98,8 +103,16 @@ public class FlushAndCommitStrategy implements StreamLoadStrategy {
         return flushRegions;
     }
     
+    /**
+     * In multi-table mode, age-based commit is disabled (commits are event-driven
+     * via PartitionCommitTracker). In normal mode, standard age-based commit applies.
+     */
     public boolean shouldCommit(TableRegion region) {
-        return enableAutoCommit && region.getAge() > ageThreshold;
+        return enableAutoCommit && !multiTableTransactionEnabled && region.getAge() > ageThreshold;
+    }
+
+    public boolean isMultiTableTransactionEnabled() {
+        return multiTableTransactionEnabled;
     }
 
     @Override
@@ -110,6 +123,7 @@ public class FlushAndCommitStrategy implements StreamLoadStrategy {
                 ", ageThreshold=" + ageThreshold +
                 ", maxCacheBytes=" + maxCacheBytes +
                 ", enableAutoCommit=" + enableAutoCommit +
+                ", multiTableTransactionEnabled=" + multiTableTransactionEnabled +
                 ", numAgeTriggerFlush=" + numAgeTriggerFlush +
                 ", numCacheTriggerFlush=" + numCacheTriggerFlush +
                 ", numTableTriggerFlush=" + numTableTriggerFlush +
