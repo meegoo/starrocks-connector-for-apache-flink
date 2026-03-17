@@ -23,9 +23,11 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Tracks per-partition transaction boundary state for multi-table transaction mode.
@@ -52,10 +54,12 @@ public class PartitionCommitTracker {
     }
 
     private final Map<Integer, PartitionState> partitions = new LinkedHashMap<>();
-    /** Counts consecutive commit cycles where a partition stayed SWITCHED (idle). */
-    private final Map<Integer, Integer> idleCycleCount = new LinkedHashMap<>();
-    /** Remove a partition after this many consecutive idle commit cycles. */
-    private static final int MAX_IDLE_CYCLES = 3;
+    /**
+     * Tracks txnEnd signals that arrived while a partition was SWITCHED (during an
+     * in-flight commit). These are replayed during {@link #reset()} so the boundary
+     * is not lost for the next commit cycle.
+     */
+    private final Set<Integer> pendingTxnEnd = new HashSet<>();
     private final long commitIntervalMs;
     private volatile long lastCommitTimeMs;
 
@@ -65,12 +69,14 @@ public class PartitionCommitTracker {
     }
 
     /**
-     * Called when data is written for a partition. Registers the partition as active
-     * if not already tracked (or re-activates it after a commit reset).
+     * Called when data is written for a partition. Always (re-)sets the partition to
+     * ACTIVE. This is critical when a partition that was TXN_END_RECEIVED or SWITCHED
+     * receives data from a new source transaction — the state must be reset so the
+     * new data is not prematurely included in the current commit cycle.
      */
     public synchronized void onWrite(int partition) {
-        partitions.putIfAbsent(partition, PartitionState.ACTIVE);
-        idleCycleCount.remove(partition);
+        partitions.put(partition, PartitionState.ACTIVE);
+        pendingTxnEnd.remove(partition);
     }
 
     /**
@@ -86,14 +92,19 @@ public class PartitionCommitTracker {
             // next commit cycle; the empty-chunk case is handled gracefully downstream.
             LOG.info("[MultiTxn] txnEnd for unknown/evicted partition {}, re-registering", partition);
             partitions.put(partition, PartitionState.TXN_END_RECEIVED);
-            idleCycleCount.remove(partition);
             return isIntervalElapsed();
         }
         if (state == PartitionState.ACTIVE) {
             partitions.put(partition, PartitionState.TXN_END_RECEIVED);
+        } else if (state == PartitionState.SWITCHED) {
+            // Partition is currently in an in-flight commit cycle. Record the txnEnd
+            // so reset() can promote it to TXN_END_RECEIVED for the next cycle,
+            // preventing the boundary from being lost.
+            pendingTxnEnd.add(partition);
+            LOG.debug("[MultiTxn] txnEnd for SWITCHED partition {}, recorded as pending", partition);
         }
-        // If already TXN_END_RECEIVED or SWITCHED, a second txnEnd accumulates
-        // more data into the same commit cycle (N:1 mapping) — no state change needed.
+        // If already TXN_END_RECEIVED, a second txnEnd accumulates more data into the
+        // same commit cycle (N:1 mapping) — no state change needed.
         return isIntervalElapsed();
     }
 
@@ -140,35 +151,44 @@ public class PartitionCommitTracker {
     /**
      * Resets state after a successful commit.
      *
-     * <p>SWITCHED partitions are reset to ACTIVE (awaiting next txnEnd).
-     * Partitions that received new txnEnd during the commit phase retain
-     * their TXN_END_RECEIVED state for the next commit cycle.
+     * <p>SWITCHED partitions that received new data during the commit phase will
+     * already have been moved to ACTIVE by {@link #onWrite}, so they are retained.
+     * Remaining SWITCHED partitions (idle — no new data arrived) are removed from
+     * tracking entirely. If they produce data later, {@link #onWrite} will re-register
+     * them. This prevents idle partitions from permanently blocking
+     * {@link #allSwitched()}.
+     *
+     * <p>Partitions that received a txnEnd while SWITCHED (recorded in
+     * {@link #pendingTxnEnd}) are promoted to TXN_END_RECEIVED so the boundary
+     * is preserved for the next commit cycle.
      */
     public synchronized void reset() {
         lastCommitTimeMs = System.currentTimeMillis();
 
-        // Track idle cycles and evict partitions that have been idle too long
+        // Remove idle SWITCHED partitions (those that received no new data during
+        // the commit phase). Partitions that got new writes are already ACTIVE.
         List<Integer> toRemove = new ArrayList<>();
-        partitions.replaceAll((partition, state) -> {
-            if (state == PartitionState.SWITCHED) {
-                int cycles = idleCycleCount.getOrDefault(partition, 0) + 1;
-                if (cycles >= MAX_IDLE_CYCLES) {
-                    toRemove.add(partition);
+        for (Map.Entry<Integer, PartitionState> entry : partitions.entrySet()) {
+            if (entry.getValue() == PartitionState.SWITCHED) {
+                int partition = entry.getKey();
+                if (pendingTxnEnd.contains(partition)) {
+                    // A txnEnd arrived while SWITCHED — promote to TXN_END_RECEIVED
+                    // so the next commit cycle picks it up immediately.
+                    entry.setValue(PartitionState.TXN_END_RECEIVED);
+                    LOG.debug("[MultiTxn] Promoted partition {} to TXN_END_RECEIVED from pending txnEnd",
+                            partition);
                 } else {
-                    idleCycleCount.put(partition, cycles);
+                    toRemove.add(partition);
                 }
-                return PartitionState.ACTIVE;
             }
-            return state;
-        });
+        }
 
         for (Integer partition : toRemove) {
             partitions.remove(partition);
-            idleCycleCount.remove(partition);
-            LOG.info("[MultiTxn] Evicted idle partition {} after {} consecutive idle cycles",
-                    partition, MAX_IDLE_CYCLES);
+            LOG.debug("[MultiTxn] Removed idle SWITCHED partition {} from tracking", partition);
         }
 
+        pendingTxnEnd.clear();
         LOG.info("[MultiTxn] PartitionCommitTracker reset, partitions: {}", partitions);
     }
 
