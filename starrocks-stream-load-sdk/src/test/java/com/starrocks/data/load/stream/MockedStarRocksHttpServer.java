@@ -41,6 +41,7 @@ import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Minimal mock of StarRocks FE HTTP APIs for tests.
@@ -141,6 +142,11 @@ public class MockedStarRocksHttpServer {
 
     private final Random random = new Random(1234);
 
+    private final AtomicInteger beginCount = new AtomicInteger(0);
+    private final AtomicInteger loadCount = new AtomicInteger(0);
+    private final AtomicInteger prepareCount = new AtomicInteger(0);
+    private final AtomicInteger commitCount = new AtomicInteger(0);
+
     private MockedStarRocksHttpServer(int port, boolean enforceAuth, String username, String password) throws IOException {
         this.bindAddress = new InetSocketAddress("127.0.0.1", port);
         this.server = HttpServer.create(this.bindAddress, 0);
@@ -194,6 +200,18 @@ public class MockedStarRocksHttpServer {
     public void setRollbackOverride(ResponseOverride override) { this.rollbackOverride = override; }
 
     public void setStreamLoadOverride(ResponseOverride override) { this.streamLoadOverride = override; }
+
+    public int getBeginCount() { return beginCount.get(); }
+    public int getLoadCount() { return loadCount.get(); }
+    public int getPrepareCount() { return prepareCount.get(); }
+    public int getCommitCount() { return commitCount.get(); }
+
+    public void resetCounters() {
+        beginCount.set(0);
+        loadCount.set(0);
+        prepareCount.set(0);
+        commitCount.set(0);
+    }
 
     public void putErrorLog(String label, String content) {
         errorLogs.put(label, content);
@@ -352,6 +370,7 @@ public class MockedStarRocksHttpServer {
                 return;
             }
 
+            beginCount.incrementAndGet();
             ResponseOverride override = beginOverride;
             LabelKey key = new LabelKey(db, table, label);
             LabelInfo info = getOrCreateLabel(key);
@@ -400,6 +419,7 @@ public class MockedStarRocksHttpServer {
 
             // consume body
             readBody(exchange);
+            loadCount.incrementAndGet();
 
             ResponseOverride override = txnLoadOverride;
             if (override != null) {
@@ -456,6 +476,7 @@ public class MockedStarRocksHttpServer {
                 return;
             }
 
+            prepareCount.incrementAndGet();
             ResponseOverride override = prepareOverride;
             if (override != null) {
                 if (override.includeErrorURL && override.errorLogContent != null) {
@@ -500,6 +521,7 @@ public class MockedStarRocksHttpServer {
                 return;
             }
 
+            commitCount.incrementAndGet();
             ResponseOverride override = commitOverride;
             if (override != null) {
                 if (override.includeErrorURL && override.errorLogContent != null) {
