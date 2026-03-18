@@ -140,7 +140,19 @@ public class StarRocksWriter<InputT>
         if (rowData == null) {
             return;
         }
-        sinkManager.write(rowData.getUniqueKey(), rowData.getDatabase(), rowData.getTable(), rowData.getRow());
+        int partition = rowData.getSourcePartition();
+        if (rowData.getRow() == null) {
+            if (rowData.isTransactionEnd()) {
+                sinkManager.setCommitAllowed(partition, true);
+            }
+            return;
+        }
+        if (partition >= 0) {
+            sinkManager.write(partition, rowData.getDatabase(), rowData.getTable(), rowData.getRow());
+            sinkManager.setCommitAllowed(partition, rowData.isTransactionEnd());
+        } else {
+            sinkManager.write(rowData.getUniqueKey(), rowData.getDatabase(), rowData.getTable(), rowData.getRow());
+        }
         totalReceivedRows += 1;
         if (totalReceivedRows % 100 == 1) {
             LOG.debug("Received raw record: {}", element);
