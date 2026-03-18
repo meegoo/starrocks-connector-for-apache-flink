@@ -210,8 +210,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     }
 
                     if (savepoint) {
-                        if (multiTableTransactionEnabled && txnCoordinator != null && txnCoordinator.isActive()) {
-                            LOG.info("[MultiTxn] Savepoint with active shared transaction; completing before savepoint");
+                        if (multiTableTransactionEnabled && txnCoordinator != null) {
+                            LOG.info("[MultiTxn] Savepoint in multi-table mode; txnActive={}",
+                                    txnCoordinator.isActive());
                             // Wait for any in-flight loads to complete
                             for (TransactionTableRegion region : flushQ) {
                                 Future<?> result = region.getResult();
@@ -223,6 +224,27 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     }
                                 }
                             }
+                            // Begin a shared transaction if one is not already active.
+                            // This covers the case where a checkpoint/savepoint fires
+                            // before any txnEnd-driven commit cycle has started a shared
+                            // transaction.  Without this, the code would fall through to
+                            // the per-region independent commit path, violating multi-table
+                            // atomicity.
+                            if (!txnCoordinator.isActive()) {
+                                String anyDb = null;
+                                String anyTable = null;
+                                for (TransactionTableRegion region : flushQ) {
+                                    if (anyDb == null) {
+                                        anyDb = region.getDatabase();
+                                        anyTable = region.getTable();
+                                    }
+                                }
+                                if (anyDb != null) {
+                                    txnCoordinator.begin(anyDb, anyTable);
+                                    LOG.info("[MultiTxn] Began shared transaction for savepoint: label={}",
+                                            txnCoordinator.getSharedLabel());
+                                }
+                            }
                             // Switch ALL regions' active chunks into inactive queues so
                             // that any residual data (e.g. from partitions that never
                             // reached txnEnd) is included in the shared transaction.
@@ -231,6 +253,16 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             // violating multi-table atomicity.
                             for (TransactionTableRegion region : flushQ) {
                                 region.switchChunkForCommit();
+                            }
+                            // Inject shared label into all regions so loads use the
+                            // shared transaction.  Safe to call even when the label was
+                            // already set — the value is idempotent.
+                            if (txnCoordinator.isActive()) {
+                                for (TransactionTableRegion region : flushQ) {
+                                    if (!region.isRetrying()) {
+                                        region.setLabel(txnCoordinator.getSharedLabel());
+                                    }
+                                }
                             }
                             // Trigger loads for regions with pending data that haven't loaded yet
                             for (TransactionTableRegion region : flushQ) {
@@ -260,7 +292,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     anyTable = region.getTable();
                                 }
                             }
-                            if (allLoadsDone && anyTable != null) {
+                            if (allLoadsDone && anyTable != null && txnCoordinator.isActive()) {
                                 try {
                                     txnCoordinator.prepareAndCommit(anyTable);
                                     LOG.info("[MultiTxn] Shared transaction committed during savepoint");
@@ -269,6 +301,8 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     LOG.error("[MultiTxn] Failed to commit shared transaction during savepoint", ex);
                                     this.e = ex;
                                 }
+                            } else if (flushQ.isEmpty()) {
+                                allRegionsCommitted = true;
                             }
                             txnCoordinator.reset();
                             commitInFlight.set(false);
@@ -377,13 +411,15 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             return;
         }
 
-        // txnEnd received for this partition
-        boolean intervalReady = partitionTracker.onTxnEnd(partition);
-        LOG.debug("[MultiTxn] txnEnd for partition={}, intervalReady={}", partition, intervalReady);
-
-        if (intervalReady) {
-            trySwitchAndCommit();
-        }
+        // txnEnd received for this partition — always attempt switch+commit.
+        // getReadyToSwitch() enforces the flush-interval gate internally, so
+        // the call is cheap when the interval has not elapsed.  Removing the
+        // outer intervalReady guard fixes a liveness gap: when all txnEnds
+        // arrive *before* the interval elapses, the old code would never
+        // re-check once the interval finally passes.
+        partitionTracker.onTxnEnd(partition);
+        LOG.debug("[MultiTxn] txnEnd for partition={}", partition);
+        trySwitchAndCommit();
     }
 
     /**
