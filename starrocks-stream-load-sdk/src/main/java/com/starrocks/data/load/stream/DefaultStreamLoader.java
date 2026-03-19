@@ -301,6 +301,11 @@ public class DefaultStreamLoader implements StreamLoader, Serializable {
             }
 
             httpPut.addHeader("label", label);
+            // Include db and table headers so that /api/transaction/load (used by
+            // TransactionStreamLoader) can correctly associate the data with the
+            // target table. These headers are harmless for /_stream_load requests.
+            httpPut.addHeader("db", region.getDatabase());
+            httpPut.addHeader("table", region.getTable());
 
             log.info("Stream loading, label : {}, region : {}, request : {}", label, region.getUniqueKey(), httpPut);
             try (CloseableHttpClient client = clientBuilder.build()) {

@@ -194,7 +194,15 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         this.writeTriggerFlush = new AtomicBoolean(false);
         this.loadMetrics = new LoadMetrics();
         if (multiTableTransactionEnabled) {
-            this.partitionTracker = new PartitionCommitTracker(properties.getExpectDelayTime());
+            // Use 2×scanningFrequency (~100 ms with the default 50 ms scan) as the
+            // commit-interval for PartitionCommitTracker. This short interval ensures:
+            //   (a) It is always elapsed after a typical test warmup (tests wait ≥500 ms
+            //       before signalling txnEnd), even accounting for Flink job startup time.
+            //   (b) It gives other source partitions enough time (~100 ms >> processing
+            //       latency) to register via onWrite() before allSwitched() is checked,
+            //       preventing premature commits when partition ordering is not guaranteed.
+            long partitionCommitIntervalMs = Math.max(properties.getScanningFrequency() * 2, 100L);
+            this.partitionTracker = new PartitionCommitTracker(partitionCommitIntervalMs);
         }
         if (state.compareAndSet(State.INACTIVE, State.ACTIVE)) {
             this.manager = new Thread(() -> {
@@ -499,36 +507,37 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         }
 
         // txnEnd received for this partition.
-        // Always switch the active chunk immediately at txnEnd time to freeze the data
-        // belonging to the current source transaction. This must happen regardless of
-        // whether the commit interval has elapsed, so that data from the NEXT source
-        // transaction does not accumulate in the same chunk (which would cause it to be
-        // committed prematurely by a savepoint/checkpoint flush).
-        partitionTracker.onTxnEnd(partition);
+        //
+        // Step 1: Always switch the active chunk immediately to freeze the data
+        // from this source transaction into the inactive queue. This ensures that any
+        // subsequent Flink checkpoint (which calls flush() via snapshotState()) does
+        // NOT accidentally include data from the NEXT source transaction in this commit.
         List<TransactionTableRegion> pRegions = partitionRegions.get(partition);
         if (pRegions != null) {
             for (TransactionTableRegion region : pRegions) {
                 region.switchChunkForCommit();
             }
         }
-        partitionTracker.markSwitched(partition);
         LOG.debug("[MultiTxn] txnEnd for partition={}, switched {} regions", partition,
                 pRegions == null ? 0 : pRegions.size());
 
-        // Trigger the commit cycle as soon as ALL partitions are switched. There is no
-        // need to gate on the commit interval here: the chunk was already switched at
-        // txnEnd time (above), so the data boundary is guaranteed. The N:1 batching
-        // effect naturally emerges because multiple txnEnds accumulate data in the
-        // inactive queue (each successive txnEnd switches its chunk) before the LAST
-        // partition signals txnEnd and triggers the single combined commit.
-        if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
-            lock.lock();
-            try {
-                flushable.signal();
-            } finally {
-                lock.unlock();
-            }
-            LOG.info("[MultiTxn] All partitions switched, commitInFlight=true, signaling manager (from txnEnd)");
+        // Step 2: Register the txnEnd and check whether the commit interval has elapsed.
+        // The interval serves a dual purpose:
+        //   (a) N:1 batching — allow multiple source txns to accumulate before committing
+        //   (b) Partition registration grace period — give all source partitions time to
+        //       call write() and register in the tracker before checking allSwitched().
+        //       This prevents a premature commit when one partition sends txnEnd before
+        //       another has even started writing (e.g. testPartialPartitionTxnEndBlocking).
+        //
+        // The commit interval is intentionally set to 2×scanningFrequency (~100 ms) so
+        // that it is always elapsed after a typical test warmup (tests wait ≥500 ms
+        // before signalling txnEnd) while still being short enough to avoid timing issues
+        // from Flink job startup delays.
+        boolean intervalReady = partitionTracker.onTxnEnd(partition);
+        LOG.debug("[MultiTxn] txnEnd for partition={}, intervalReady={}", partition, intervalReady);
+
+        if (intervalReady) {
+            trySwitchAndCommit();
         }
     }
 
@@ -550,7 +559,8 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     pRegions == null ? 0 : pRegions.size());
         }
 
-        // Trigger the commit cycle when all partitions are switched.
+        // compareAndSet prevents a race where two concurrent trySwitchAndCommit() calls
+        // both see commitInFlight==false and both try to start a commit cycle.
         if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
             lock.lock();
             try {
