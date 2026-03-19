@@ -475,14 +475,34 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             return;
         }
 
-        // txnEnd received for this partition
-        boolean intervalReady = partitionTracker.onTxnEnd(partition);
-        System.err.println("[DIAG setCommitAllowed] partition=" + partition + " intervalReady=" + intervalReady
-                + " commitInFlight=" + commitInFlight.get());
-        LOG.debug("[MultiTxn] txnEnd for partition={}, intervalReady={}", partition, intervalReady);
+        // txnEnd received for this partition.
+        // Always switch the active chunk immediately at txnEnd time to freeze the data
+        // belonging to the current source transaction. This must happen regardless of
+        // whether the commit interval has elapsed, so that data from the NEXT source
+        // transaction does not accumulate in the same chunk (which would cause it to be
+        // committed prematurely by a savepoint/checkpoint flush).
+        partitionTracker.onTxnEnd(partition);
+        List<TransactionTableRegion> pRegions = partitionRegions.get(partition);
+        if (pRegions != null) {
+            for (TransactionTableRegion region : pRegions) {
+                region.switchChunkForCommit();
+            }
+        }
+        partitionTracker.markSwitched(partition);
+        LOG.debug("[MultiTxn] txnEnd for partition={}, switched {} regions", partition,
+                pRegions == null ? 0 : pRegions.size());
 
-        if (intervalReady) {
-            trySwitchAndCommit();
+        // Trigger the commit cycle only if all partitions are switched AND the interval
+        // has elapsed (supporting N:1 batching of source transactions).
+        if (partitionTracker.allSwitched() && partitionTracker.isIntervalElapsed()
+                && commitInFlight.compareAndSet(false, true)) {
+            lock.lock();
+            try {
+                flushable.signal();
+            } finally {
+                lock.unlock();
+            }
+            LOG.info("[MultiTxn] All partitions switched, commitInFlight=true, signaling manager (from txnEnd)");
         }
     }
 
@@ -504,9 +524,12 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     pRegions == null ? 0 : pRegions.size());
         }
 
-        // compareAndSet prevents a race where two concurrent trySwitchAndCommit() calls
-        // both see commitInFlight==false and both try to start a commit cycle.
-        if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
+        // Trigger the commit cycle only if all partitions are switched AND the interval
+        // has elapsed. Adding isIntervalElapsed() here prevents a spurious commit from
+        // being triggered by the manager-thread periodic call when the interval has not
+        // yet elapsed but all partitions happen to be in SWITCHED state.
+        if (partitionTracker.allSwitched() && partitionTracker.isIntervalElapsed()
+                && commitInFlight.compareAndSet(false, true)) {
             lock.lock();
             try {
                 flushable.signal();
@@ -534,14 +557,6 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // cache bytes) may change during iteration; this is handled by the state machine.
         final List<TransactionTableRegion> regionSnapshot =
                 Collections.unmodifiableList(new ArrayList<>(flushQ));
-        System.err.println("[DIAG processMultiTableCommit] txnActive=" + txnCoordinator.isActive()
-                + " regions=" + regionSnapshot.size());
-        for (TransactionTableRegion r : regionSnapshot) {
-            System.err.println("[DIAG processMultiTableCommit] region=" + r.getUniqueKey()
-                    + " cacheBytes=" + r.getCacheBytes()
-                    + " label=" + r.getLabel()
-                    + " state=" + r.getStateForLog());
-        }
         try {
             if (!txnCoordinator.isActive()) {
                 // Ensure no region is still flushing or retrying from a previous cycle.
@@ -764,22 +779,6 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     public void flush() {
         LOG.info("Stream load manager flush start - currentCacheBytes: {}, maxCacheBytes: {}",
                 currentCacheBytes.get(), maxCacheBytes);
-        // [DIAG] Print flush caller for debugging
-        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
-        StringBuilder caller = new StringBuilder("[DIAG flush] called from: ");
-        for (int i = 2; i < Math.min(stack.length, 8); i++) {
-            caller.append(stack[i].getClassName()).append(".").append(stack[i].getMethodName())
-                  .append(":").append(stack[i].getLineNumber()).append(" | ");
-        }
-        System.err.println(caller.toString());
-        System.err.println("[DIAG flush] txnCoordinator.isActive=" + (txnCoordinator != null && txnCoordinator.isActive())
-                + ", commitInFlight=" + commitInFlight.get()
-                + ", currentCacheBytes=" + currentCacheBytes.get());
-        for (TransactionTableRegion r : flushQ) {
-            System.err.println("[DIAG flush] region=" + r.getUniqueKey()
-                    + " cacheBytes=" + r.getCacheBytes()
-                    + " state=" + r.getStateForLog());
-        }
 
         initializeFlushState();
 

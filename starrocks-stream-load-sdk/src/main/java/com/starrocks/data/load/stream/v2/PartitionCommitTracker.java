@@ -144,7 +144,7 @@ public class PartitionCommitTracker {
         return true;
     }
 
-    private boolean isIntervalElapsed() {
+    public boolean isIntervalElapsed() {
         return System.currentTimeMillis() - lastCommitTimeMs >= commitIntervalMs;
     }
 
