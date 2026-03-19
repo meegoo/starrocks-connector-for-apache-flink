@@ -74,16 +74,16 @@ public class PartitionCommitTracker {
      * receives data from a new source transaction — the state must be reset so the
      * new data is not prematurely included in the current commit cycle.
      *
-     * <p>Also resets {@code lastCommitTimeMs} to ensure that the commit interval is
-     * measured from the most recent data write rather than from job start. This
-     * guarantees that the interval elapses naturally after a source quiesce period
-     * (the time between the last write and txnEnd) rather than depending on when
-     * the Flink job started relative to the test timer.
+     * <p>Note: {@code lastCommitTimeMs} is intentionally NOT reset here. The commit
+     * interval is measured from the later of: (a) job start (partitionTracker creation),
+     * or (b) the last successful commit cycle (reset()). This means the interval elapses
+     * based on how long the job has been running or how long since the last commit, NOT
+     * from when individual records were written. This makes the timing deterministic
+     * regardless of when the Flink sink task processes records.
      */
     public synchronized void onWrite(int partition) {
         partitions.put(partition, PartitionState.ACTIVE);
         pendingTxnEnd.remove(partition);
-        lastCommitTimeMs = System.currentTimeMillis();
     }
 
     /**
@@ -155,13 +155,7 @@ public class PartitionCommitTracker {
         return System.currentTimeMillis() - lastCommitTimeMs >= commitIntervalMs;
     }
 
-    public long getLastCommitTimeMs() {
-        return lastCommitTimeMs;
-    }
 
-    public long getCommitIntervalMs() {
-        return commitIntervalMs;
-    }
 
 
     /**

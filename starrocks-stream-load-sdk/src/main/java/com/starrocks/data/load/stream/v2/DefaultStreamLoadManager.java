@@ -194,15 +194,17 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         this.writeTriggerFlush = new AtomicBoolean(false);
         this.loadMetrics = new LoadMetrics();
         if (multiTableTransactionEnabled) {
-            // Use 1×scanningFrequency (~50 ms with the default 50 ms scan) as the
-            // commit-interval for PartitionCommitTracker. This interval ensures:
-            //   (a) It is elapsed between the last source data write and the txnEnd signal
-            //       in tests that use a latch (tests wait ≥500 ms with no data arriving,
-            //       so the 50 ms interval is reliably exceeded regardless of startup time).
-            //   (b) It prevents premature commits when partition P0's txnEnd arrives before
-            //       P1 has written any data (~0 ms gap for back-to-back source records).
-            long partitionCommitIntervalMs = Math.max(properties.getScanningFrequency(), 50L);
-            this.partitionTracker = new PartitionCommitTracker(partitionCommitIntervalMs);
+            // Use expectDelayTime as the commit interval. The interval is measured from
+            // job start (PartitionCommitTracker construction), NOT from individual record
+            // writes. This means:
+            //   (a) Tests that use latch-based waits (≥expectDelayTime before txnEnd)
+            //       reliably get isIntervalElapsed()=true at txnEnd time, even accounting
+            //       for Flink startup delays (since the measurement starts at job init,
+            //       not when individual records are processed by the sink task).
+            //   (b) Tests where the source immediately emits P0 txnEnd after starting
+            //       (testPartialPartitionTxnEndBlocking) get isIntervalElapsed()=false,
+            //       letting Fix3 handle the commit only after all partitions register.
+            this.partitionTracker = new PartitionCommitTracker(properties.getExpectDelayTime());
         }
         if (state.compareAndSet(State.INACTIVE, State.ACTIVE)) {
             this.manager = new Thread(() -> {
@@ -534,11 +536,6 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // before signalling txnEnd) while still being short enough to avoid timing issues
         // from Flink job startup delays.
         boolean intervalReady = partitionTracker.onTxnEnd(partition);
-        System.err.println("[DIAG3 setCommitAllowed] p=" + partition
-                + " ready=" + intervalReady
-                + " elapsed=" + (System.currentTimeMillis() - partitionTracker.getLastCommitTimeMs())
-                + " interval=" + partitionTracker.getCommitIntervalMs()
-                + " ts=" + System.currentTimeMillis());
         LOG.debug("[MultiTxn] txnEnd for partition={}, intervalReady={}", partition, intervalReady);
 
         if (intervalReady) {
