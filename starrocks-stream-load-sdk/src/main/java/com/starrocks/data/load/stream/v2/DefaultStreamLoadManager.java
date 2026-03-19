@@ -534,6 +534,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // before signalling txnEnd) while still being short enough to avoid timing issues
         // from Flink job startup delays.
         boolean intervalReady = partitionTracker.onTxnEnd(partition);
+        System.err.println("[DIAG3 setCommitAllowed] p=" + partition
+                + " ready=" + intervalReady
+                + " elapsed=" + (System.currentTimeMillis() - partitionTracker.getLastCommitTimeMs())
+                + " interval=" + partitionTracker.getCommitIntervalMs()
+                + " ts=" + System.currentTimeMillis());
         LOG.debug("[MultiTxn] txnEnd for partition={}, intervalReady={}", partition, intervalReady);
 
         if (intervalReady) {
