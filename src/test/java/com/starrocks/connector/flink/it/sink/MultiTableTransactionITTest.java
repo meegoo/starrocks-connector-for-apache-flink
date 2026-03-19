@@ -241,15 +241,26 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             }
         }, "flink-job-thread");
         jobThread.start();
+        long testStartMs = System.currentTimeMillis();
 
         try {
             // Wait 2× flush interval — the age-based timer fires but commitAllowed=false
             Thread.sleep(2L * FLUSH_INTERVAL_MS);
+            long elapsedBeforeCheck = System.currentTimeMillis() - testStartMs;
+            LOG.info("[DIAG testNoFlushBeforeTxnEnd] Test thread: waited {}ms (2×{}ms), checking tables at t={}ms",
+                    elapsedBeforeCheck, FLUSH_INTERVAL_MS, elapsedBeforeCheck);
+
+            // [DIAG] Log actual table state before txnEnd assertion
+            List<List<Object>> ordersBeforeTxnEnd = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            List<List<Object>> itemsBeforeTxnEnd = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable);
+            LOG.info("[DIAG testNoFlushBeforeTxnEnd] Before txnEnd (after 2×{}ms): orders.size={}, order_items.size={}. orders={}, order_items={}",
+                    FLUSH_INTERVAL_MS, ordersBeforeTxnEnd.size(), itemsBeforeTxnEnd.size(),
+                    ordersBeforeTxnEnd, itemsBeforeTxnEnd);
 
             assertEquals("orders must be empty before txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
+                    0, ordersBeforeTxnEnd.size());
             assertEquals("order_items must be empty before txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+                    0, itemsBeforeTxnEnd.size());
 
             LOG.info("Confirmed: no data visible before txnEnd. Sending txnEnd signal.");
             TxnEndControlledSource.SEND_TXN_END_LATCH.countDown();
@@ -326,12 +337,16 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             }
         }, "flink-job-thread");
         jobThread.start();
+        long testStartMs = System.currentTimeMillis();
 
         try {
             // ---- Phase 1: txn-1 data emitted, no txnEnd yet ----
             Thread.sleep(2L * FLUSH_INTERVAL_MS);
+            List<List<Object>> ordersBeforeTxn1 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            LOG.info("[DIAG testMultipleConsecutiveTransactions] Phase1 before txn-1 txnEnd (t={}ms): orders.size={}, orders={}",
+                    System.currentTimeMillis() - testStartMs, ordersBeforeTxn1.size(), ordersBeforeTxn1);
             assertEquals("orders empty before txn-1 txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
+                    0, ordersBeforeTxn1.size());
 
             // Allow txn-1 to commit
             MultiTxnControlledSource.TXN1_END_LATCH.countDown();
@@ -341,6 +356,10 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
             // txn-1 data must now be visible
             List<List<Object>> afterTxn1 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            String diagMsg1 = String.format("[DIAG testMultipleConsecutiveTransactions] After txn-1 commit (waited %dms): orders.size=%d, orders=%s",
+                    COMMIT_PROPAGATION_MS, afterTxn1.size(), afterTxn1);
+            LOG.info(diagMsg1);
+            System.out.println(diagMsg1);
             assertEquals("orders must have 1 row after txn-1", 1, afterTxn1.size());
             verifyResult(
                     Arrays.asList(Arrays.asList(1L, 100L, new BigDecimal("10.00"), "created")),
@@ -350,6 +369,8 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             // commitInFlight was reset to false after txn-1 commit
             Thread.sleep(2L * FLUSH_INTERVAL_MS);
             List<List<Object>> midTxn2 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            LOG.info("[DIAG testMultipleConsecutiveTransactions] Mid txn-2 (before txn-2 txnEnd): orders.size={}, orders={}",
+                    midTxn2.size(), midTxn2);
             assertEquals("orders must still have only 1 row (txn-2 not committed yet)",
                     1, midTxn2.size());
 
@@ -449,10 +470,15 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             // Wait for data to be buffered but not committed
             Thread.sleep(2L * FLUSH_INTERVAL_MS);
 
+            List<List<Object>> ordersBefore = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            List<List<Object>> itemsBefore = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable);
+            LOG.info("[DIAG testAtomicVisibilityAcrossTables] Before txnEnd: orders.size={}, order_items.size={}, orders={}, items={}",
+                    ordersBefore.size(), itemsBefore.size(), ordersBefore, itemsBefore);
+
             assertEquals("orders must be empty before txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
+                    0, ordersBefore.size());
             assertEquals("order_items must be empty before txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+                    0, itemsBefore.size());
 
             // Signal txnEnd
             AtomicVisibilitySource.SEND_TXN_END_LATCH.countDown();
@@ -470,9 +496,15 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
             // Verify atomicity: exactly 1 finished transaction with our label prefix
             List<TransactionInfo> txns = getFinishedTransactionInfo(labelPrefix);
-            LOG.info("Finished transactions with prefix '{}': {}", labelPrefix, txns.size());
-            for (TransactionInfo txn : txns) {
-                LOG.info("  txn: label={}, status={}", txn.label, txn.transactionStatus);
+            String diagTxns = String.format("[DIAG testAtomicVisibilityAcrossTables] Finished transactions with prefix '%s': count=%d", labelPrefix, txns.size());
+            LOG.info(diagTxns);
+            System.out.println(diagTxns);
+            for (int i = 0; i < txns.size(); i++) {
+                TransactionInfo txn = txns.get(i);
+                String txnLine = String.format("[DIAG testAtomicVisibilityAcrossTables]   txn[%d]: label=%s, status=%s, txnId=%d, coordinator=%s, loadJobSourceType=%s",
+                        i, txn.label, txn.transactionStatus, txn.transactionId, txn.coordinator, txn.loadJobSourceType);
+                LOG.info(txnLine);
+                System.out.println(txnLine);
             }
 
             // Filter for COMMITTED (not ABORTED) transactions
@@ -480,6 +512,10 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                     .filter(t -> "COMMITTED".equalsIgnoreCase(t.transactionStatus)
                             || "VISIBLE".equalsIgnoreCase(t.transactionStatus))
                     .count();
+            String diagCount = String.format("[DIAG testAtomicVisibilityAcrossTables] committedCount=%d (expected 1), orders.size=%d, order_items.size=%d",
+                    committedCount, ordersAfter.size(), itemsAfter.size());
+            LOG.info(diagCount);
+            System.out.println(diagCount);
             assertEquals("Exactly 1 committed transaction expected (shared label for both tables)",
                     1, committedCount);
 
@@ -674,6 +710,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         @Override
         public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
             // Phase 1: data rows, no txnEnd
+            long t0 = System.currentTimeMillis();
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":1,\"customer_id\":100,\"total_amount\":99.99,\"order_status\":\"created\"}",
                     0, false));
@@ -683,12 +720,16 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             ctx.collect(row(DB, ORDER_ITEMS_TABLE,
                     "{\"item_id\":2,\"order_id\":1,\"product_name\":\"gadget\",\"quantity\":1,\"price\":50.00}",
                     0, false));
+            LOG.info("[DIAG TxnEndControlledSource] Phase1: emitted 3 data rows at t={}ms", System.currentTimeMillis() - t0);
 
             SEND_TXN_END_LATCH.await();
+            long t1 = System.currentTimeMillis();
+            LOG.info("[DIAG TxnEndControlledSource] SEND_TXN_END_LATCH released at t={}ms (test thread signaled)", t1 - t0);
 
             // Phase 2: txnEnd marker (null row = no data, just signal end-of-transaction)
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));
             TXN_END_EMITTED_LATCH.countDown();
+            LOG.info("[DIAG TxnEndControlledSource] Phase2: emitted txnEnd at t={}ms", System.currentTimeMillis() - t0);
         }
 
         @Override
@@ -727,23 +768,28 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         @Override
         public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            long t0 = System.currentTimeMillis();
             // txn-1 data
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":1,\"customer_id\":100,\"total_amount\":10.00,\"order_status\":\"created\"}",
                     0, false));
+            LOG.info("[DIAG MultiTxnControlledSource] txn-1 data emitted at t={}ms", System.currentTimeMillis() - t0);
 
             TXN1_END_LATCH.await();
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));  // txn-1 end
             TXN1_END_EMITTED_LATCH.countDown();
+            LOG.info("[DIAG MultiTxnControlledSource] txn-1 txnEnd emitted at t={}ms", System.currentTimeMillis() - t0);
 
             // txn-2 data (commitInFlight re-armed to false after txn-1 commit)
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":2,\"customer_id\":101,\"total_amount\":20.00,\"order_status\":\"created\"}",
                     0, false));
+            LOG.info("[DIAG MultiTxnControlledSource] txn-2 data emitted at t={}ms", System.currentTimeMillis() - t0);
 
             TXN2_END_LATCH.await();
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));  // txn-2 end
             TXN2_END_EMITTED_LATCH.countDown();
+            LOG.info("[DIAG MultiTxnControlledSource] txn-2 txnEnd emitted at t={}ms", System.currentTimeMillis() - t0);
         }
 
         @Override
@@ -782,6 +828,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         @Override
         public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            long t0 = System.currentTimeMillis();
             // Emit data to both tables in partition 0
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":1,\"customer_id\":100,\"total_amount\":88.88,\"order_status\":\"pending\"}",
@@ -792,10 +839,12 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             ctx.collect(row(DB, ORDER_ITEMS_TABLE,
                     "{\"item_id\":2,\"order_id\":1,\"product_name\":\"beta\",\"quantity\":2,\"price\":22.22}",
                     0, false));
+            LOG.info("[DIAG AtomicVisibilitySource] Emitted 3 data rows at t={}ms", System.currentTimeMillis() - t0);
 
             SEND_TXN_END_LATCH.await();
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));
             TXN_END_EMITTED_LATCH.countDown();
+            LOG.info("[DIAG AtomicVisibilitySource] Emitted txnEnd at t={}ms", System.currentTimeMillis() - t0);
         }
 
         @Override
