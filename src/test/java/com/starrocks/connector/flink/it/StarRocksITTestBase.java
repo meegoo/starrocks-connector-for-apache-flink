@@ -47,6 +47,16 @@ public abstract class StarRocksITTestBase {
 
     private static final boolean DEBUG_MODE = false;
 
+    // System properties for specifying an external StarRocks cluster:
+    //   -Dit.starrocks.fe.http=<host>:<port>   e.g. 172.26.95.228:8030
+    //   -Dit.starrocks.fe.jdbc=jdbc:mysql://<host>:<port>  e.g. jdbc:mysql://172.26.95.228:9030
+    //   -Dit.starrocks.username=root
+    //   -Dit.starrocks.password=
+    private static final String PROP_FE_HTTP = "it.starrocks.fe.http";
+    private static final String PROP_FE_JDBC = "it.starrocks.fe.jdbc";
+    private static final String PROP_USERNAME = "it.starrocks.username";
+    private static final String PROP_PASSWORD = "it.starrocks.password";
+
     @Rule
     public TemporaryFolder temporaryFolder = new TemporaryFolder();
 
@@ -58,30 +68,17 @@ public abstract class StarRocksITTestBase {
     protected static Connection DB_CONNECTION;
     protected static Set<String> DATABASE_SET_TO_CLEAN;
 
-    /**
-     * Resolve config: system property first, then environment variable.
-     * Supported: it.starrocks.http-urls / SR_HTTP_URLS, it.starrocks.jdbc-urls / SR_JDBC_URLS,
-     * it.starrocks.username / SR_USERNAME, it.starrocks.password / SR_PASSWORD.
-     * When SR_HTTP_URLS and SR_JDBC_URLS are set, use external cluster (e.g. TSP) and skip Testcontainers.
-     */
-    private static String resolveConfig(String propKey, String envKey, String defaultValue) {
-        String v = System.getProperty(propKey);
-        if (v != null && !v.isEmpty()) {
-            return v;
-        }
-        v = System.getenv(envKey);
-        return (v != null && !v.isEmpty()) ? v : defaultValue;
-    }
-
     @BeforeClass
     public static void setUp() throws Exception {
-        String extHttp = resolveConfig("it.starrocks.http-urls", "SR_HTTP_URLS", null);
-        String extJdbc = resolveConfig("it.starrocks.jdbc-urls", "SR_JDBC_URLS", null);
-        if (extHttp != null && extJdbc != null) {
-            HTTP_URLS = extHttp;
-            JDBC_URLS = extJdbc;
-            USERNAME = resolveConfig("it.starrocks.username", "SR_USERNAME", "root");
-            PASSWORD = resolveConfig("it.starrocks.password", "SR_PASSWORD", "");
+        String extFeHttp = System.getProperty(PROP_FE_HTTP);
+        String extFeJdbc = System.getProperty(PROP_FE_JDBC);
+        if (extFeHttp != null && !extFeHttp.isEmpty()
+                && extFeJdbc != null && !extFeJdbc.isEmpty()) {
+            // Use the externally provided StarRocks cluster directly
+            HTTP_URLS = extFeHttp;
+            JDBC_URLS = extFeJdbc;
+            USERNAME = System.getProperty(PROP_USERNAME, "root");
+            PASSWORD = System.getProperty(PROP_PASSWORD, "");
             LOG.info("Using external StarRocks cluster: http={}, jdbc={}", HTTP_URLS, JDBC_URLS);
         } else if (!DEBUG_MODE) {
             try {
@@ -95,8 +92,7 @@ public abstract class StarRocksITTestBase {
                 LOG.warn("Failed to start StarRocks container, ITs may be skipped if no external cluster is provided.", t);
             }
         }
-        assertTrue("HTTP_URLS and JDBC_URLS must be set. Use SR_HTTP_URLS/SR_JDBC_URLS or it.starrocks.http-urls/jdbc-urls for TSP cluster.",
-                HTTP_URLS != null && JDBC_URLS != null);
+        assertTrue(HTTP_URLS != null && JDBC_URLS != null);
 
         DB_NAME = "sr_test_" + genRandomUuid();
         try {

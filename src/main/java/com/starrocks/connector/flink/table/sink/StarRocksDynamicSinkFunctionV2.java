@@ -136,14 +136,22 @@ public class StarRocksDynamicSinkFunctionV2<T> extends StarRocksDynamicSinkFunct
                 return;
             } else if (value instanceof StarRocksRowData) {
                 StarRocksRowData data = (StarRocksRowData) value;
+                int partition = data.getSourcePartition();
                 if (Strings.isNullOrEmpty(data.getDatabase())
                         || Strings.isNullOrEmpty(data.getTable())
                         || data.getRow() == null) {
-                    log.warn(String.format("json row data not fulfilled. {database: %s, table: %s, dataRows: %s}",
-                            data.getDatabase(), data.getTable(), data.getRow() == null ? "null" : "Redacted"));
+                    if (data.isTransactionEnd()) {
+                        log.debug("[MultiTxn] invoke: control-only txnEnd row, partition={}", partition);
+                        sinkManager.setCommitAllowed(partition, true);
+                    }
                     return;
                 }
-                sinkManager.write(data.getUniqueKey(), data.getDatabase(), data.getTable(), data.getRow());
+                if (partition >= 0) {
+                    sinkManager.write(partition, data.getDatabase(), data.getTable(), data.getRow());
+                    sinkManager.setCommitAllowed(partition, data.isTransactionEnd());
+                } else {
+                    sinkManager.write(data.getUniqueKey(), data.getDatabase(), data.getTable(), data.getRow());
+                }
                 return;
             }
             // raw data sink
