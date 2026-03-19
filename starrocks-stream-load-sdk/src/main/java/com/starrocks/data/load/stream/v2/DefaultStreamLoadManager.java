@@ -550,15 +550,13 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     private void trySwitchAndCommit() {
         List<Integer> readyPartitions = partitionTracker.getReadyToSwitch();
         for (int p : readyPartitions) {
-            List<TransactionTableRegion> pRegions = partitionRegions.get(p);
-            if (pRegions != null) {
-                for (TransactionTableRegion region : pRegions) {
-                    region.switchChunkForCommit();
-                }
-            }
+            // The chunk switch for data boundary enforcement was already performed by
+            // setCommitAllowed() via the early switchChunkForCommit() call. Here we only
+            // need to update the tracker state to SWITCHED so allSwitched() sees it.
+            // Calling switchChunkForCommit() again would inadvertently move data from
+            // the NEXT source transaction's active chunk into the inactive queue.
             partitionTracker.markSwitched(p);
-            LOG.debug("[MultiTxn] partition {} switched, regions={}", p,
-                    pRegions == null ? 0 : pRegions.size());
+            LOG.debug("[MultiTxn] partition {} marked switched (interval elapsed)", p);
         }
 
         // compareAndSet prevents a race where two concurrent trySwitchAndCommit() calls
