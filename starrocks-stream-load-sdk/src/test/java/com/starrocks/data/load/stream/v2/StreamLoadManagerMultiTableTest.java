@@ -241,7 +241,9 @@ public class StreamLoadManagerMultiTableTest {
             manager.write(0, "test", "order_items",
                     "{\"item_id\":1, \"order_id\":1}");
 
-            // setCommitAllowed(0, true) is NOT called — flush() must commit via savepoint path
+            // setCommitAllowed(0, true) is NOT called — flush() must commit via savepoint path.
+            // prepareForClose() signals that this is a closing flush (safe to commit active chunks).
+            manager.prepareForClose();
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
 

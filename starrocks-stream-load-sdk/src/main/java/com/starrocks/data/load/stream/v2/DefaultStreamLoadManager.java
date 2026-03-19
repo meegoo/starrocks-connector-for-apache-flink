@@ -121,6 +121,16 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
     private final boolean multiTableTransactionEnabled;
 
+    /**
+     * Set to {@code true} when the sink is about to close. In the savepoint
+     * path, this flag allows Fix 2 to also switch and commit active chunks —
+     * safe because no more records will arrive after close().
+     * For mid-job checkpoints ({@code snapshotState()}), this is {@code false}
+     * so that active chunks (containing data from the next source transaction)
+     * are left untouched.
+     */
+    private volatile boolean closingMode = false;
+
     /** Tracks per-partition transaction boundaries (multi-table mode only). */
     private transient PartitionCommitTracker partitionTracker;
 
@@ -282,11 +292,16 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 }
                             }
                         } else if (multiTableTransactionEnabled && txnCoordinator != null) {
-                            // Savepoint in multi-table mode but no commit cycle is active yet
-                            // (e.g. flush() called from close() before the commit interval elapsed,
-                            // or before any txnEnd was received). We need to flush all buffered
-                            // data under a single shared transaction to preserve atomicity.
-                            LOG.info("[MultiTxn] Savepoint with no active shared transaction; starting new shared commit");
+                            // Savepoint in multi-table mode but no commit cycle is active yet.
+                            // Two cases:
+                            //  (a) closingMode=true  (flush() called from close()): safe to
+                            //      commit all data including active chunks, because no more
+                            //      records will arrive.
+                            //  (b) closingMode=false (flush() from snapshotState/checkpoint):
+                            //      only commit data already in inactive queues (switched by a
+                            //      prior txnEnd). Active chunks must NOT be touched because they
+                            //      contain data from the NEXT source transaction.
+                            LOG.info("[MultiTxn] Savepoint with no active shared transaction; closingMode={}", closingMode);
                             // Wait for any residual in-flight loads from previous cycles
                             for (TransactionTableRegion region : flushQ) {
                                 Future<?> result = region.getResult();
@@ -298,10 +313,13 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     }
                                 }
                             }
-                            // Move all active chunks into inactive queues so the data
-                            // is picked up by triggerLoadIfNeeded() below.
-                            for (TransactionTableRegion region : flushQ) {
-                                region.switchChunkForCommit();
+                            // In closing mode: move all active chunks into inactive queues.
+                            // In checkpoint mode: leave active chunks untouched; only commit
+                            // data already in the inactive queues (committed by prior txnEnd).
+                            if (closingMode) {
+                                for (TransactionTableRegion region : flushQ) {
+                                    region.switchChunkForCommit();
+                                }
                             }
                             // Determine any participating db/table; check whether there is
                             // data to commit before opening a transaction.
@@ -459,6 +477,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             LOG.info("StarRocks-Sink-Manager start, enableAutoCommit: {}, streamLoader: {}, {}",
                     enableAutoCommit, streamLoader.getClass().getName(), EnvUtils.getGitInformation());
         }
+    }
+
+    @Override
+    public void prepareForClose() {
+        this.closingMode = true;
     }
 
     @Override
@@ -907,6 +930,15 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
     private boolean isSavepointFinished() {
         if (e != null) {
+            return true;
+        }
+        // In multi-table mode during a mid-job checkpoint (closingMode=false), active
+        // chunks may contain data from future source transactions that must NOT be
+        // committed. allRegionsCommitted=true means all in-progress loads finished and
+        // any data in inactive queues was committed; active chunk data is intentionally
+        // left for the next txnEnd. The checkpoint is therefore complete even though
+        // currentCacheBytes may be > 0.
+        if (multiTableTransactionEnabled && !closingMode && allRegionsCommitted) {
             return true;
         }
         return currentCacheBytes.get() == 0L && (!enableAutoCommit || allRegionsCommitted);

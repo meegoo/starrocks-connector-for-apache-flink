@@ -49,6 +49,16 @@ public interface StreamLoadManager {
         // ignore
     }
 
+    /**
+     * Signals that the next {@link #flush()} call is the final flush before
+     * {@link #close()}. In multi-table transaction mode, this allows the
+     * savepoint path to also commit data from active chunks (not yet closed
+     * by a txnEnd), which is safe because no more data will arrive.
+     */
+    default void prepareForClose() {
+        // default no-op; override in multi-table implementations
+    }
+
     default void setMetricListener(MetricListener metricListener) {}
 
     default void setCommitAllowed(boolean allowed) {}

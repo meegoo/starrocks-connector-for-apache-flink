@@ -258,6 +258,10 @@ public class StarRocksDynamicSinkFunctionV2<T> extends StarRocksDynamicSinkFunct
     public void close() {
         log.info("Close sink function");
         try {
+            // Signal that this flush is the final one before close(), so the
+            // savepoint path can also commit data from active chunks (safe because
+            // no more records will arrive).
+            sinkManager.prepareForClose();
             sinkManager.flush();
         } catch (Exception e) {
             log.error("Failed to flush when closing", e);

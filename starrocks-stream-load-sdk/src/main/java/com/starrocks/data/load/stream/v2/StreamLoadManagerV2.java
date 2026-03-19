@@ -114,6 +114,10 @@ public class StreamLoadManagerV2 implements StreamLoadManager, Serializable {
     }
 
     @Override
+    public void prepareForClose() {
+        delegateManager.prepareForClose();
+    }
+
     public void setLabelGeneratorFactory(LabelGeneratorFactory labelGeneratorFactory) {
         delegateManager.setLabelGeneratorFactory(labelGeneratorFactory);
     }
