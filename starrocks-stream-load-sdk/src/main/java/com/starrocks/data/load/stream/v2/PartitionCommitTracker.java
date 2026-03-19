@@ -69,19 +69,40 @@ public class PartitionCommitTracker {
     }
 
     /**
-     * Called when data is written for a partition. Always (re-)sets the partition to
-     * ACTIVE. This is critical when a partition that was TXN_END_RECEIVED or SWITCHED
-     * receives data from a new source transaction — the state must be reset so the
-     * new data is not prematurely included in the current commit cycle.
+     * Called when data is written for a partition.
      *
-     * <p>Note: {@code lastCommitTimeMs} is intentionally NOT reset here. The commit
-     * interval is measured from the later of: (a) job start (partitionTracker creation),
-     * or (b) the last successful commit cycle (reset()). This means the interval elapses
-     * based on how long the job has been running or how long since the last commit, NOT
-     * from when individual records were written. This makes the timing deterministic
-     * regardless of when the Flink sink task processes records.
+     * <p>If the partition is in {@code ACTIVE} state (or not yet registered), sets it
+     * to {@code ACTIVE} as expected.
+     *
+     * <p>If the partition is in {@code TXN_END_RECEIVED} or {@code SWITCHED} state
+     * (i.e. a txnEnd was already received for the current commit cycle), the state is
+     * NOT overridden. The new data belongs to the NEXT source transaction and will be
+     * routed to a new active chunk (the previous active chunk was already frozen by the
+     * {@code switchChunkForCommit()} call in {@code setCommitAllowed()}). Preserving
+     * the {@code TXN_END_RECEIVED/SWITCHED} state ensures that {@code allSwitched()}
+     * continues to return the correct value for the ongoing commit cycle: if all
+     * partitions were SWITCHED, new data from the SAME partition should not cancel the
+     * pending commit.
+     *
+     * <p>This is the key invariant that separates consecutive transactions:
+     * <ul>
+     *   <li>testMultipleConsecutiveTransactions: txn-1 txnEnd → P0=TXN_END_RECEIVED.
+     *       txn-2 data arrives immediately after but does NOT reset P0 to ACTIVE.
+     *       The manager thread eventually switches P0 and commits txn-1 data only.</li>
+     *   <li>testPartialPartitionTxnEndBlocking: P0 txnEnd → P0=TXN_END_RECEIVED.
+     *       P1 data (a different partition) is registered as ACTIVE. The manager
+     *       sees P0=SWITCHED, P1=ACTIVE, so allSwitched()=false → commit blocked.</li>
+     * </ul>
      */
     public synchronized void onWrite(int partition) {
+        PartitionState state = partitions.get(partition);
+        if (state == PartitionState.TXN_END_RECEIVED || state == PartitionState.SWITCHED) {
+            // txnEnd was already received for this partition; new data belongs to the
+            // next transaction. Preserve the current state so the ongoing commit cycle
+            // is not disrupted. The data goes into the new active chunk created after
+            // switchChunkForCommit() in setCommitAllowed().
+            return;
+        }
         partitions.put(partition, PartitionState.ACTIVE);
         pendingTxnEnd.remove(partition);
     }
