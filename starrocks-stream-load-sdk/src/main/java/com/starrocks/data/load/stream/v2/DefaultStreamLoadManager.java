@@ -377,7 +377,13 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     this.e = ex;
                                 }
                             }
-                            System.err.println("[DIAG4 Fix2] anyLoadTriggered=" + anyLoadTriggered + " e=" + this.e);
+                            StringBuilder dbg2 = new StringBuilder("[DIAG4 Fix2] anyLoadTriggered=" + anyLoadTriggered + " e=" + this.e);
+                            for (TransactionTableRegion r : flushQ) {
+                                dbg2.append(" [").append(r.getTable()).append(":state=").append(r.getStateForLog())
+                                   .append(",inactiveSize=").append("?")
+                                   .append(",label=").append(r.getLabel()).append("]");
+                            }
+                            System.err.println(dbg2.toString());
                             // Wait for all triggered loads to complete
                             boolean allLoadsDone = false;
                             while (!allLoadsDone && this.e == null) {
@@ -393,6 +399,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 }
                             }
                             // Commit the shared transaction if loads succeeded and data was sent
+                            System.err.println("[DIAG4 Fix2] after wait: allLoadsDone=" + allLoadsDone + " e=" + (this.e != null ? this.e.getMessage().substring(0, Math.min(60, this.e.getMessage().length())) : "null"));
                             if (allLoadsDone) {
                                 if (anyLoadTriggered && txnCoordinator.isActive()) {
                                     try {
