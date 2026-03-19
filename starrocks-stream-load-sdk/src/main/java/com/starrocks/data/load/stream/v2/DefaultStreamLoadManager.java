@@ -348,7 +348,12 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     hasData = true;
                                 }
                             }
-                            System.err.println("[DIAG4 Fix2] anyDb=" + anyDb + " anyTable=" + anyTable + " hasData=" + hasData);
+                            StringBuilder dbg = new StringBuilder("[DIAG4 Fix2] anyDb=" + anyDb + " hasData=" + hasData);
+                            for (TransactionTableRegion r : flushQ) {
+                                dbg.append(" [").append(r.getTable()).append(":cacheBytes=").append(r.getCacheBytes())
+                                   .append(",state=").append(r.getStateForLog()).append(",label=").append(r.getLabel()).append("]");
+                            }
+                            System.err.println(dbg.toString());
                             boolean anyLoadTriggered = false;
                             if (anyDb != null && hasData) {
                                 try {
