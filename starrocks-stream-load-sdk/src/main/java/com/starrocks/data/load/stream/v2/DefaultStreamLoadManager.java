@@ -477,6 +477,8 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
         // txnEnd received for this partition
         boolean intervalReady = partitionTracker.onTxnEnd(partition);
+        System.err.println("[DIAG setCommitAllowed] partition=" + partition + " intervalReady=" + intervalReady
+                + " commitInFlight=" + commitInFlight.get());
         LOG.debug("[MultiTxn] txnEnd for partition={}, intervalReady={}", partition, intervalReady);
 
         if (intervalReady) {
@@ -532,6 +534,14 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // cache bytes) may change during iteration; this is handled by the state machine.
         final List<TransactionTableRegion> regionSnapshot =
                 Collections.unmodifiableList(new ArrayList<>(flushQ));
+        System.err.println("[DIAG processMultiTableCommit] txnActive=" + txnCoordinator.isActive()
+                + " regions=" + regionSnapshot.size());
+        for (TransactionTableRegion r : regionSnapshot) {
+            System.err.println("[DIAG processMultiTableCommit] region=" + r.getUniqueKey()
+                    + " cacheBytes=" + r.getCacheBytes()
+                    + " label=" + r.getLabel()
+                    + " state=" + r.getStateForLog());
+        }
         try {
             if (!txnCoordinator.isActive()) {
                 // Ensure no region is still flushing or retrying from a previous cycle.
@@ -754,6 +764,22 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     public void flush() {
         LOG.info("Stream load manager flush start - currentCacheBytes: {}, maxCacheBytes: {}",
                 currentCacheBytes.get(), maxCacheBytes);
+        // [DIAG] Print flush caller for debugging
+        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
+        StringBuilder caller = new StringBuilder("[DIAG flush] called from: ");
+        for (int i = 2; i < Math.min(stack.length, 8); i++) {
+            caller.append(stack[i].getClassName()).append(".").append(stack[i].getMethodName())
+                  .append(":").append(stack[i].getLineNumber()).append(" | ");
+        }
+        System.err.println(caller.toString());
+        System.err.println("[DIAG flush] txnCoordinator.isActive=" + (txnCoordinator != null && txnCoordinator.isActive())
+                + ", commitInFlight=" + commitInFlight.get()
+                + ", currentCacheBytes=" + currentCacheBytes.get());
+        for (TransactionTableRegion r : flushQ) {
+            System.err.println("[DIAG flush] region=" + r.getUniqueKey()
+                    + " cacheBytes=" + r.getCacheBytes()
+                    + " state=" + r.getStateForLog());
+        }
 
         initializeFlushState();
 
