@@ -104,7 +104,20 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         this.manager = manager;
         enableTransaction();
         initTxHeaders(properties);
+        // Preserve the Authorization header when the FE redirects transaction API
+        // requests to a BE (cross-host 307 redirect). Apache HttpClient strips
+        // the Authorization header on cross-host redirects by default; we add a
+        // CredentialsProvider with AuthScope.ANY so that the HttpClient re-adds
+        // the credentials when authenticating against the redirected BE host.
+        org.apache.http.client.CredentialsProvider credentialsProvider =
+                new org.apache.http.impl.client.BasicCredentialsProvider();
+        credentialsProvider.setCredentials(
+                org.apache.http.auth.AuthScope.ANY,
+                new org.apache.http.auth.UsernamePasswordCredentials(
+                        properties.getUsername(),
+                        properties.getPassword() == null ? "" : properties.getPassword()));
         clientBuilder = HttpClients.custom()
+                .setDefaultCredentialsProvider(credentialsProvider)
                 .setRedirectStrategy(new DefaultRedirectStrategy() {
                     @Override
                     protected boolean isRedirectable(String method) {
