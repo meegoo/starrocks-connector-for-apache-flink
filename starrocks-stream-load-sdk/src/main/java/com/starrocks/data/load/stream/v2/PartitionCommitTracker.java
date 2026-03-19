@@ -155,6 +155,10 @@ public class PartitionCommitTracker {
         return System.currentTimeMillis() - lastCommitTimeMs >= commitIntervalMs;
     }
 
+    public long getCommitIntervalMs() {
+        return commitIntervalMs;
+    }
+
     /**
      * Resets state after a successful commit.
      *
