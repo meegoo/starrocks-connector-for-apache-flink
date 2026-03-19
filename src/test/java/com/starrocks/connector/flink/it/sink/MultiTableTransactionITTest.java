@@ -90,10 +90,11 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      *
      * <p>With the event-driven commit implementation, the task thread executes
      * {@code switchChunk} immediately on txnEnd, then the manager thread drives:
-     * HTTP load (~100 ms) → prepare (~50 ms) → commit (~50 ms).
-     * We add a 2 s buffer for CI/network variance.
+     * HTTP load (~100-500 ms) → prepare (~50-200 ms) → commit (~50-200 ms).
+     * We add a 5 s buffer for CI/network variance, especially for freshly
+     * provisioned TSP clusters where the first few HTTP round-trips may be slow.
      */
-    private static final long COMMIT_PROPAGATION_MS = 2_000L;
+    private static final long COMMIT_PROPAGATION_MS = 5_000L;
 
     // -------------------------------------------------------------------------
     // DDL helpers
