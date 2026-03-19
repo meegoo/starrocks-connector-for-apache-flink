@@ -194,14 +194,14 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         this.writeTriggerFlush = new AtomicBoolean(false);
         this.loadMetrics = new LoadMetrics();
         if (multiTableTransactionEnabled) {
-            // Use 2×scanningFrequency (~100 ms with the default 50 ms scan) as the
-            // commit-interval for PartitionCommitTracker. This short interval ensures:
-            //   (a) It is always elapsed after a typical test warmup (tests wait ≥500 ms
-            //       before signalling txnEnd), even accounting for Flink job startup time.
-            //   (b) It gives other source partitions enough time (~100 ms >> processing
-            //       latency) to register via onWrite() before allSwitched() is checked,
-            //       preventing premature commits when partition ordering is not guaranteed.
-            long partitionCommitIntervalMs = Math.max(properties.getScanningFrequency() * 2, 100L);
+            // Use 1×scanningFrequency (~50 ms with the default 50 ms scan) as the
+            // commit-interval for PartitionCommitTracker. This interval ensures:
+            //   (a) It is elapsed between the last source data write and the txnEnd signal
+            //       in tests that use a latch (tests wait ≥500 ms with no data arriving,
+            //       so the 50 ms interval is reliably exceeded regardless of startup time).
+            //   (b) It prevents premature commits when partition P0's txnEnd arrives before
+            //       P1 has written any data (~0 ms gap for back-to-back source records).
+            long partitionCommitIntervalMs = Math.max(properties.getScanningFrequency(), 50L);
             this.partitionTracker = new PartitionCommitTracker(partitionCommitIntervalMs);
         }
         if (state.compareAndSet(State.INACTIVE, State.ACTIVE)) {
@@ -534,8 +534,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // before signalling txnEnd) while still being short enough to avoid timing issues
         // from Flink job startup delays.
         boolean intervalReady = partitionTracker.onTxnEnd(partition);
-        LOG.info("[MultiTxn] txnEnd for partition={}, intervalReady={}, commitIntervalMs={}",
-                partition, intervalReady, partitionTracker.getCommitIntervalMs());
+        LOG.debug("[MultiTxn] txnEnd for partition={}, intervalReady={}", partition, intervalReady);
 
         if (intervalReady) {
             trySwitchAndCommit();
