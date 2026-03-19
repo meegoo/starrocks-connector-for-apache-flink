@@ -105,19 +105,20 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         enableTransaction();
         initTxHeaders(properties);
         // Preserve the Authorization header when the FE redirects transaction API
-        // requests to a BE (cross-host 307 redirect). Apache HttpClient strips
-        // the Authorization header on cross-host redirects by default; we add a
-        // CredentialsProvider with AuthScope.ANY so that the HttpClient re-adds
-        // the credentials when authenticating against the redirected BE host.
-        org.apache.http.client.CredentialsProvider credentialsProvider =
-                new org.apache.http.impl.client.BasicCredentialsProvider();
-        credentialsProvider.setCredentials(
-                org.apache.http.auth.AuthScope.ANY,
-                new org.apache.http.auth.UsernamePasswordCredentials(
-                        properties.getUsername(),
-                        properties.getPassword() == null ? "" : properties.getPassword()));
+        // requests to a BE node (cross-host 307 redirect). Apache HttpClient strips
+        // the Authorization header on cross-host redirects by default. We add an
+        // HttpRequestInterceptor that re-adds the Authorization header to every
+        // outgoing request if it is missing, ensuring that redirected requests to
+        // BE nodes also carry the authentication credentials.
+        final String authHeader = StreamLoadUtils.getBasicAuthHeader(
+                properties.getUsername(),
+                properties.getPassword() == null ? "" : properties.getPassword());
         clientBuilder = HttpClients.custom()
-                .setDefaultCredentialsProvider(credentialsProvider)
+                .addInterceptorFirst((org.apache.http.HttpRequestInterceptor) (request, context) -> {
+                    if (!request.containsHeader(HttpHeaders.AUTHORIZATION)) {
+                        request.addHeader(HttpHeaders.AUTHORIZATION, authHeader);
+                    }
+                })
                 .setRedirectStrategy(new DefaultRedirectStrategy() {
                     @Override
                     protected boolean isRedirectable(String method) {
