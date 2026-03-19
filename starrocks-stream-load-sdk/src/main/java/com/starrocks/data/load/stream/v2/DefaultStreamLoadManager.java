@@ -399,7 +399,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 }
                             }
                             // Commit the shared transaction if loads succeeded and data was sent
-                            System.err.println("[DIAG4 Fix2] after wait: allLoadsDone=" + allLoadsDone + " e=" + (this.e != null ? this.e.getMessage().substring(0, Math.min(60, this.e.getMessage().length())) : "null"));
+                            System.err.println("[DIAG4 Fix2] after wait: allLoadsDone=" + allLoadsDone + " e=" + (this.e != null ? this.e.getMessage() : "null"));
                             if (allLoadsDone) {
                                 if (anyLoadTriggered && txnCoordinator.isActive()) {
                                     try {
