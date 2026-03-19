@@ -73,10 +73,17 @@ public class PartitionCommitTracker {
      * ACTIVE. This is critical when a partition that was TXN_END_RECEIVED or SWITCHED
      * receives data from a new source transaction — the state must be reset so the
      * new data is not prematurely included in the current commit cycle.
+     *
+     * <p>Also resets {@code lastCommitTimeMs} to ensure that the commit interval is
+     * measured from the most recent data write rather than from job start. This
+     * guarantees that the interval elapses naturally after a source quiesce period
+     * (the time between the last write and txnEnd) rather than depending on when
+     * the Flink job started relative to the test timer.
      */
     public synchronized void onWrite(int partition) {
         partitions.put(partition, PartitionState.ACTIVE);
         pendingTxnEnd.remove(partition);
+        lastCommitTimeMs = System.currentTimeMillis();
     }
 
     /**
