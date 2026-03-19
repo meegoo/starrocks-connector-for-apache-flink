@@ -492,16 +492,13 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         LOG.debug("[MultiTxn] txnEnd for partition={}, switched {} regions", partition,
                 pRegions == null ? 0 : pRegions.size());
 
-        // Trigger the commit cycle only if all partitions are switched AND the interval
-        // has elapsed (supporting N:1 batching of source transactions).
-        boolean intervalElapsed = partitionTracker.isIntervalElapsed();
-        boolean allSwitched = partitionTracker.allSwitched();
-        System.err.println("[DIAG2 setCommitAllowed] partition=" + partition
-                + " allSwitched=" + allSwitched + " intervalElapsed=" + intervalElapsed
-                + " commitInFlight=" + commitInFlight.get()
-                + " pRegions=" + (pRegions == null ? "null" : pRegions.size())
-                + " ts=" + System.currentTimeMillis());
-        if (allSwitched && intervalElapsed && commitInFlight.compareAndSet(false, true)) {
+        // Trigger the commit cycle as soon as ALL partitions are switched. There is no
+        // need to gate on the commit interval here: the chunk was already switched at
+        // txnEnd time (above), so the data boundary is guaranteed. The N:1 batching
+        // effect naturally emerges because multiple txnEnds accumulate data in the
+        // inactive queue (each successive txnEnd switches its chunk) before the LAST
+        // partition signals txnEnd and triggers the single combined commit.
+        if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
             lock.lock();
             try {
                 flushable.signal();
@@ -530,12 +527,8 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     pRegions == null ? 0 : pRegions.size());
         }
 
-        // Trigger the commit cycle only if all partitions are switched AND the interval
-        // has elapsed. Adding isIntervalElapsed() here prevents a spurious commit from
-        // being triggered by the manager-thread periodic call when the interval has not
-        // yet elapsed but all partitions happen to be in SWITCHED state.
-        if (partitionTracker.allSwitched() && partitionTracker.isIntervalElapsed()
-                && commitInFlight.compareAndSet(false, true)) {
+        // Trigger the commit cycle when all partitions are switched.
+        if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
             lock.lock();
             try {
                 flushable.signal();
@@ -563,9 +556,6 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // cache bytes) may change during iteration; this is handled by the state machine.
         final List<TransactionTableRegion> regionSnapshot =
                 Collections.unmodifiableList(new ArrayList<>(flushQ));
-        System.err.println("[DIAG2 processMultiTableCommit] txnActive=" + txnCoordinator.isActive()
-                + " commitInFlight=" + commitInFlight.get() + " regions=" + regionSnapshot.size()
-                + " ts=" + System.currentTimeMillis());
         try {
             if (!txnCoordinator.isActive()) {
                 // Ensure no region is still flushing or retrying from a previous cycle.
@@ -600,10 +590,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     return;
                 }
 
-                System.err.println("[DIAG2 processMultiTableCommit] about to begin txn, anyDb=" + anyDb
-                        + " anyTable=" + anyTable + " ts=" + System.currentTimeMillis());
                 txnCoordinator.begin(anyDb, anyTable);
-                System.err.println("[DIAG2 processMultiTableCommit] began txn, label=" + txnCoordinator.getSharedLabel());
 
                 for (TransactionTableRegion region : regionSnapshot) {
                     // setLabel() throws IllegalStateException if the region is retrying
@@ -619,11 +606,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                         txnCoordinator.reset();
                         return;
                     }
-                    boolean triggered = region.triggerLoadIfNeeded();
-                    System.err.println("[DIAG2 processMultiTableCommit] triggerLoadIfNeeded region=" + region.getUniqueKey()
-                            + " triggered=" + triggered + " cacheBytes=" + region.getCacheBytes()
-                            + " state=" + region.getStateForLog());
-                    if (triggered) {
+                    if (region.triggerLoadIfNeeded()) {
                         LOG.debug("[MultiTxn] triggered load for region={}", region.getUniqueKey());
                     }
                 }
@@ -645,10 +628,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             }
 
             if (anyTable != null) {
-                System.err.println("[DIAG2 processMultiTableCommit] about to prepareAndCommit, anyTable=" + anyTable
-                        + " label=" + txnCoordinator.getSharedLabel() + " ts=" + System.currentTimeMillis());
                 txnCoordinator.prepareAndCommit(anyTable);
-                System.err.println("[DIAG2 processMultiTableCommit] prepareAndCommit done ts=" + System.currentTimeMillis());
             }
 
             for (TransactionTableRegion region : regionSnapshot) {
