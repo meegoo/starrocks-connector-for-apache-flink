@@ -311,6 +311,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             //      only commit data already in inactive queues (switched by a
                             //      prior txnEnd). Active chunks must NOT be touched because they
                             //      contain data from the NEXT source transaction.
+                            System.err.println("[DIAG4 Fix2] closingMode=" + closingMode
+                                    + " flushQ.size=" + flushQ.size()
+                                    + " ts=" + System.currentTimeMillis());
                             LOG.info("[MultiTxn] Savepoint with no active shared transaction; closingMode={}", closingMode);
                             // Wait for any residual in-flight loads from previous cycles
                             for (TransactionTableRegion region : flushQ) {
@@ -345,10 +348,12 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     hasData = true;
                                 }
                             }
+                            System.err.println("[DIAG4 Fix2] anyDb=" + anyDb + " anyTable=" + anyTable + " hasData=" + hasData);
                             boolean anyLoadTriggered = false;
                             if (anyDb != null && hasData) {
                                 try {
                                     txnCoordinator.begin(anyDb, anyTable);
+                                    System.err.println("[DIAG4 Fix2] begin succeeded, label=" + txnCoordinator.getSharedLabel());
                                     for (TransactionTableRegion region : flushQ) {
                                         try {
                                             region.setLabel(txnCoordinator.getSharedLabel());
@@ -362,9 +367,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     }
                                 } catch (Exception ex) {
                                     LOG.error("[MultiTxn] Savepoint: failed to begin shared transaction", ex);
+                                    System.err.println("[DIAG4 Fix2] begin FAILED: " + ex.getMessage());
                                     this.e = ex;
                                 }
                             }
+                            System.err.println("[DIAG4 Fix2] anyLoadTriggered=" + anyLoadTriggered + " e=" + this.e);
                             // Wait for all triggered loads to complete
                             boolean allLoadsDone = false;
                             while (!allLoadsDone && this.e == null) {
