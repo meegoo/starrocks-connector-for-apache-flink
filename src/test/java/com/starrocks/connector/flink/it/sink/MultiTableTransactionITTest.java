@@ -926,10 +926,13 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
         env.setParallelism(parallelism);
-        // Enable checkpointing with a 30-second timeout so that if a checkpoint
-        // barrier gets stuck (e.g. while the sink task thread is inside flush()),
-        // the checkpoint is aborted promptly rather than hanging for 10 minutes.
-        env.enableCheckpointing(5_000);
+        // Use a 60-second checkpoint interval so that no periodic checkpoint fires
+        // during these short-running tests (each test runs for < 30 seconds).
+        // Periodic checkpoints firing while the sink task thread is inside flush()
+        // from close() causes a deadlock (the task thread is parked, can't process
+        // the barrier, checkpoint never completes). By setting the interval to 60s,
+        // all tests complete before any checkpoint is triggered.
+        env.enableCheckpointing(60_000);
         env.getCheckpointConfig().setCheckpointTimeout(30_000);
         return env;
     }
