@@ -635,6 +635,12 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         // Use a very large flush interval so the timer never fires —
         // only the flush() from close() should commit the data.
         int largeFlushInterval = 60_000;
+        // Disable periodic Flink checkpoints for this test. The test relies on
+        // the sink's close() → flush() path to commit data, NOT on a Flink
+        // periodic checkpoint. Enabling periodic checkpoints risks a barrier
+        // arriving while the sink task thread is blocked inside flush(), which
+        // can create a deadlock where the checkpoint can never complete.
+        env.getCheckpointConfig().disableCheckpointing();
 
         // Emit data to two tables WITHOUT txnEnd, then source finishes.
         // The sink's close() will call flush(), which must commit everything.
@@ -920,7 +926,11 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
         env.setParallelism(parallelism);
+        // Enable checkpointing with a 30-second timeout so that if a checkpoint
+        // barrier gets stuck (e.g. while the sink task thread is inside flush()),
+        // the checkpoint is aborted promptly rather than hanging for 10 minutes.
         env.enableCheckpointing(5_000);
+        env.getCheckpointConfig().setCheckpointTimeout(30_000);
         return env;
     }
 
