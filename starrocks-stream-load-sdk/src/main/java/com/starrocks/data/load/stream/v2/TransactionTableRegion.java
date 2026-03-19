@@ -471,11 +471,7 @@ public class TransactionTableRegion implements TableRegion {
     @Override
     public void complete(StreamLoadResponse response) {
         Chunk chunk = inactiveChunks.remove();
-        long beforeCacheBytes = cacheBytes.get();
         cacheBytes.addAndGet(-chunk.rowBytes());
-        System.err.println("[DIAG4 complete] table=" + table + " chunkRowBytes=" + chunk.rowBytes()
-                + " beforeCacheBytes=" + beforeCacheBytes + " afterCacheBytes=" + cacheBytes.get()
-                + " inactiveLeft=" + inactiveChunks.size());
         cacheRows.addAndGet(-chunk.numRows());
         response.setFlushBytes(chunk.rowBytes());
         response.setFlushRows(chunk.numRows());

@@ -311,10 +311,6 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             //      only commit data already in inactive queues (switched by a
                             //      prior txnEnd). Active chunks must NOT be touched because they
                             //      contain data from the NEXT source transaction.
-                            System.err.println("[DIAG4 Fix2] closingMode=" + closingMode
-                                    + " flushQ.size=" + flushQ.size()
-                                    + " this.e=" + (this.e != null ? this.e.getClass().getSimpleName()+":"+this.e.getMessage().substring(0, Math.min(50, this.e.getMessage().length())) : "null")
-                                    + " ts=" + System.currentTimeMillis());
                             LOG.info("[MultiTxn] Savepoint with no active shared transaction; closingMode={}", closingMode);
                             // Wait for any residual in-flight loads from previous cycles
                             for (TransactionTableRegion region : flushQ) {
@@ -349,17 +345,10 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     hasData = true;
                                 }
                             }
-                            StringBuilder dbg = new StringBuilder("[DIAG4 Fix2] anyDb=" + anyDb + " hasData=" + hasData);
-                            for (TransactionTableRegion r : flushQ) {
-                                dbg.append(" [").append(r.getTable()).append(":cacheBytes=").append(r.getCacheBytes())
-                                   .append(",state=").append(r.getStateForLog()).append(",label=").append(r.getLabel()).append("]");
-                            }
-                            System.err.println(dbg.toString());
                             boolean anyLoadTriggered = false;
                             if (anyDb != null && hasData) {
                                 try {
                                     txnCoordinator.begin(anyDb, anyTable);
-                                    System.err.println("[DIAG4 Fix2] begin succeeded, label=" + txnCoordinator.getSharedLabel());
                                     for (TransactionTableRegion region : flushQ) {
                                         try {
                                             region.setLabel(txnCoordinator.getSharedLabel());
@@ -373,17 +362,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     }
                                 } catch (Exception ex) {
                                     LOG.error("[MultiTxn] Savepoint: failed to begin shared transaction", ex);
-                                    System.err.println("[DIAG4 Fix2] begin FAILED: " + ex.getMessage());
                                     this.e = ex;
                                 }
                             }
-                            StringBuilder dbg2 = new StringBuilder("[DIAG4 Fix2] anyLoadTriggered=" + anyLoadTriggered + " e=" + this.e);
-                            for (TransactionTableRegion r : flushQ) {
-                                dbg2.append(" [").append(r.getTable()).append(":state=").append(r.getStateForLog())
-                                   .append(",inactiveSize=").append("?")
-                                   .append(",label=").append(r.getLabel()).append("]");
-                            }
-                            System.err.println(dbg2.toString());
                             // Wait for all triggered loads to complete
                             boolean allLoadsDone = false;
                             while (!allLoadsDone && this.e == null) {
@@ -399,7 +380,6 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 }
                             }
                             // Commit the shared transaction if loads succeeded and data was sent
-                            System.err.println("[DIAG4 Fix2] after wait: allLoadsDone=" + allLoadsDone + " e=" + (this.e != null ? this.e.getMessage() : "null"));
                             if (allLoadsDone) {
                                 if (anyLoadTriggered && txnCoordinator.isActive()) {
                                     try {
