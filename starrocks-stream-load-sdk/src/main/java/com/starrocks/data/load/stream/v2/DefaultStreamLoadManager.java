@@ -313,6 +313,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             //      contain data from the NEXT source transaction.
                             System.err.println("[DIAG4 Fix2] closingMode=" + closingMode
                                     + " flushQ.size=" + flushQ.size()
+                                    + " this.e=" + (this.e != null ? this.e.getClass().getSimpleName()+":"+this.e.getMessage().substring(0, Math.min(50, this.e.getMessage().length())) : "null")
                                     + " ts=" + System.currentTimeMillis());
                             LOG.info("[MultiTxn] Savepoint with no active shared transaction; closingMode={}", closingMode);
                             // Wait for any residual in-flight loads from previous cycles
