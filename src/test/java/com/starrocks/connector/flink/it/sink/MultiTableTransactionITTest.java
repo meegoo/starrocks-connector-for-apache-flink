@@ -953,6 +953,10 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                 .withProperty("sink.buffer-flush.interval-ms", String.valueOf(flushIntervalMs))
                 .withProperty("sink.properties.format", "json")
                 .withProperty("sink.properties.strip_outer_array", "true")
+                // Limit transaction/stream load timeout to 60s (default 600s).
+                // This caps flushTimeoutMs = 66s, preventing test hangs if the
+                // manager thread gets stuck in a slow HTTP call.
+                .withProperty("sink.properties.timeout", "60")
                 .build();
 
         options.addTableProperties(StreamLoadTableProperties.builder()
@@ -990,6 +994,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                 .withProperty("sink.label-prefix", labelPrefix)
                 .withProperty("sink.properties.format", "json")
                 .withProperty("sink.properties.strip_outer_array", "true")
+                .withProperty("sink.properties.timeout", "60")
                 .build();
 
         options.addTableProperties(StreamLoadTableProperties.builder()

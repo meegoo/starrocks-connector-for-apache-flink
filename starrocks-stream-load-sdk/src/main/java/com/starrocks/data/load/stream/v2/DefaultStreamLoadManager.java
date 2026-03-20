@@ -822,12 +822,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 checkFlushTimeout(startTime);
 
                 triggerFlushSignal();
-                // Use parkNanos instead of park to ensure the flush timeout check
-                // (checkFlushTimeout) is triggered even if the manager thread is
-                // stuck in a long-running HTTP call and cannot call unpark(current).
-                // The task thread wakes up at most every scanningFrequency ms to
-                // re-check the timeout, preventing indefinite hangs.
-                LockSupport.parkNanos(current, scanningFrequency * 1_000_000L);
+                LockSupport.park(current);
 
                 if (!savepoint) {
                     break;
