@@ -308,7 +308,80 @@ $REMOTE_SSH "sudo docker run --rm \
 
 ---
 
-## 8. 如何更新本技能文档
+## 8. 运行主 StarRocks 仓库的 SQL 测试（从 Flink Connector 工作区）
+
+当任务涉及主 StarRocks 仓库中某分支新增的 SQL 测试时，无法直接使用主 StarRocks 仓库的 `run_sql_test_remote.sh`（该脚本依赖 `git branch --show-current` 返回 StarRocks 分支名）。需要手动在远程机器上创建 worktree 并运行测试。
+
+### 8.1 远程目录约定
+
+| 路径 | 说明 |
+|------|------|
+| `/home/disk4/hujie/cursor/src/starrocks` | cursor 专用 StarRocks 仓库（用于 worktree）|
+| `/home/disk4/hujie/cursor/agents/<agent-id>/starrocks` | agent worktree 目录 |
+
+`<agent-id>` 基于当前 Flink Connector 分支名生成，规则：分支名非字母数字字符替换为 `-`，截取前 40 位。  
+例：`meegoo/sql-86be` → `meegoo-sql-86be`
+
+### 8.2 完整流程
+
+```bash
+# 0. 前置：已申请 TSP 集群（参考第 7 节），FE 地址如 172.26.95.155:9030
+FE_HOST="172.26.95.155"
+SR_BRANCH="claude/chunk-random-distribution-RfcL7"  # 目标 StarRocks 分支
+AGENT_ID="meegoo-sql-86be"  # 当前 Flink Connector 分支名转换
+AGENT_DIR="/home/disk4/hujie/cursor/agents/${AGENT_ID}/starrocks"
+BASE_REPO="/home/disk4/hujie/cursor/src/starrocks"
+
+# 1. 在远程机器创建 worktree
+sshpass -p "$SSH_PASSWORD" ssh -o StrictHostKeyChecking=no "$SSH_USERNAME@$SSH_HOST" "
+  cd $BASE_REPO && git fetch origin $SR_BRANCH
+  if [ ! -d $AGENT_DIR ]; then
+    mkdir -p /home/disk4/hujie/cursor/agents/$AGENT_ID
+    git worktree add $AGENT_DIR $SR_BRANCH
+  else
+    cd $AGENT_DIR && git checkout $SR_BRANCH && git pull origin $SR_BRANCH
+  fi
+"
+
+# 2. 安装 Python 依赖（首次）
+sshpass -p "$SSH_PASSWORD" ssh ... "cd $AGENT_DIR/test && pip3 install -r requirements.txt -q"
+
+# 3. 配置测试连接 TSP 集群
+sshpass -p "$SSH_PASSWORD" ssh ... "
+  cd $AGENT_DIR/test
+  cp conf/sr.conf conf/sr_tsp.conf
+  sed -i 's/^  host = .*/  host = $FE_HOST/' conf/sr_tsp.conf
+  sed -i 's/^  port = .*/  port = 9030/' conf/sr_tsp.conf
+  sed -i 's/^  http_port = .*/  http_port = 8030/' conf/sr_tsp.conf
+"
+
+# 4. 记录模式（首次运行，生成 R 文件）
+sshpass -p "$SSH_PASSWORD" ssh ... "
+  cd $AGENT_DIR/test
+  python3 run.py --config conf/sr_tsp.conf \
+    -d sql/test_random_distribution/T/test_chunk_random_distribution \
+    -a sequential -c 1 -r -t 600
+"
+
+# 5. 验证模式（对比 R 文件运行）
+sshpass -p "$SSH_PASSWORD" ssh ... "
+  cd $AGENT_DIR/test
+  python3 run.py --config conf/sr_tsp.conf \
+    -d sql/test_random_distribution/R/test_chunk_random_distribution \
+    -a sequential -c 1 -v -t 600
+"
+```
+
+### 8.3 注意事项
+
+- **R 文件**：分支中若只有 T 文件（无对应 R 文件），需先用 `-r` 记录模式生成 R 文件，再用 `-v` 验证。
+- **BE 代码未部署**：TSP 集群运行的是 `main` 分支代码。若测试依赖 BE 代码修改（如 `tablet_info.cpp`），测试结果反映的是修改前的行为，`compression_ratio_acceptable` 等特性断言可能返回 `0`（未通过）。
+- **validate 模式通过条件**：validate 模式比对 R 文件与实际结果，若 R 文件记录的是未修复行为（如 `0`），validate 依然会通过。需确认 R 文件记录的是正确预期值（`1`）才能真正验证特性。
+- **worktree 复用**：同一 agent-id 的 worktree 会复用，再次运行时执行 `git pull` 即可。
+
+---
+
+## 9. 如何更新本技能文档
 
 当发现新的运行或测试技巧时，按以下方式更新本文件：
 
