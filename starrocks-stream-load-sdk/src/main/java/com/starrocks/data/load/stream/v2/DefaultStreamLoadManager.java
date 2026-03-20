@@ -816,13 +816,18 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
         long startTime = System.currentTimeMillis();
         long waitTime = 100; // Initial wait time: 100ms
+        // Maximum time to park per iteration: wake up periodically so that
+        // checkFlushTimeout() can fire even if the manager thread is stuck in a
+        // long-running HTTP call and never calls LockSupport.unpark(current).
+        // 1-second interval balances responsiveness vs. spurious-wakeup overhead.
+        final long parkNanosPerIter = 1_000_000_000L; // 1 second
 
         try {
             while (!isSavepointFinished()) {
                 checkFlushTimeout(startTime);
 
                 triggerFlushSignal();
-                LockSupport.park(current);
+                LockSupport.parkNanos(current, parkNanosPerIter);
 
                 if (!savepoint) {
                     break;
