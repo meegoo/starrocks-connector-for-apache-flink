@@ -156,6 +156,11 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         String orderItemsTable = createOrderItemsTable();
 
         StreamExecutionEnvironment env = buildEnv(2);
+        // Disable periodic checkpoints: Flink 1.20 requires a "final checkpoint"
+        // before allowing a job to complete in STREAMING mode with bounded sources.
+        // If checkpointing is enabled, this final checkpoint fires and never
+        // completes (sink tasks already finished), causing env.execute() to hang.
+        env.getCheckpointConfig().disableCheckpointing();
 
         DataStream<DefaultStarRocksRowData> partition0 = env.fromElements(
                 row(DB_NAME, ordersTable,
@@ -407,6 +412,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         String orderItemsTable = createOrderItemsTable();
 
         StreamExecutionEnvironment env = buildEnv(1);
+        env.getCheckpointConfig().disableCheckpointing(); // bounded source, no final checkpoint needed
         // Only a txnEnd row, no actual data
         env.fromElements(
                 row(DB_NAME, ordersTable, null, 0, true)
