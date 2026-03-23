@@ -379,6 +379,20 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             }
                         }
 
+                        // In multi-table mode, check if partitions are ready to
+                        // switch and commit.  This runs on the manager thread (not
+                        // the task thread) so that the task thread has had time to
+                        // process subsequent records and register all partitions in
+                        // the tracker before allSwitched() is evaluated.
+                        if (multiTableTransactionEnabled && partitionTracker != null) {
+                            trySwitchAndCommit();
+                            if (commitInFlight.get()) {
+                                // All partitions switched; skip autonomous flush and
+                                // enter processMultiTableCommit() on the next iteration.
+                                continue;
+                            }
+                        }
+
                         for (TransactionTableRegion region : flushQ) {
                             region.getAndIncrementAge();
                             if (flushAndCommitStrategy.shouldCommit(region)) {
@@ -437,18 +451,26 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             return;
         }
 
-        // txnEnd received for this partition
-        boolean intervalReady = partitionTracker.onTxnEnd(partition);
-        LOG.debug("[MultiTxn] txnEnd for partition={}, intervalReady={}", partition, intervalReady);
-
-        if (intervalReady) {
-            trySwitchAndCommit();
-        }
+        // Record the txnEnd in the tracker but do NOT call trySwitchAndCommit()
+        // here and do NOT signal the manager thread.  This method runs on the Flink
+        // task thread during record processing.  If we checked allSwitched() now —
+        // or if the manager thread woke up immediately from a signal — partitions
+        // whose data hasn't been processed yet (next records in the stream) would
+        // be missing from the tracker, causing a premature commit.
+        //
+        // Instead, we rely on the manager thread's periodic scan (every
+        // scanningFrequency ms, default 50 ms).  By the next scan cycle the task
+        // thread has processed all subsequent records and every partition is
+        // registered in the tracker.
+        partitionTracker.onTxnEnd(partition);
+        LOG.debug("[MultiTxn] txnEnd for partition={}", partition);
     }
 
     /**
      * Attempts to switch ready partitions and trigger a commit if all are switched.
-     * Called on the task thread.
+     * Called on the manager thread (from the normal timer-driven path) so that the
+     * task thread has had time to process subsequent records and register all
+     * partitions before allSwitched() is evaluated.
      */
     private void trySwitchAndCommit() {
         List<Integer> readyPartitions = partitionTracker.getReadyToSwitch();
@@ -464,16 +486,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     pRegions == null ? 0 : pRegions.size());
         }
 
-        // compareAndSet prevents a race where two concurrent trySwitchAndCommit() calls
-        // both see commitInFlight==false and both try to start a commit cycle.
         if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
-            lock.lock();
-            try {
-                flushable.signal();
-            } finally {
-                lock.unlock();
-            }
-            LOG.info("[MultiTxn] All partitions switched, commitInFlight=true, signaling manager");
+            // No flushable.signal() needed — this method already runs on the
+            // manager thread.  The caller will see commitInFlight==true and
+            // `continue` to the next iteration which enters processMultiTableCommit().
+            LOG.info("[MultiTxn] All partitions switched, commitInFlight=true");
         }
     }
 
