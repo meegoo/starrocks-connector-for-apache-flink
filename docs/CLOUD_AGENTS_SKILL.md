@@ -150,7 +150,7 @@ cd starrocks-stream-load-sdk && mvn -B install -Dmaven.javadoc.skip=true -DskipT
 mvn -B test -DskipTests=false -Dtest=MultiTableTransactionITTest
 ```
 
-**单方法 + 短超时**：`-Dtest=MultiTableTransactionITTest#<方法名>`；fork 进程超过 60s 时由 Maven profile `it-fork-timeout-60s` 终止（见根 `pom.xml`）。示例：`mvn -B test -Pit-fork-timeout-60s -DskipTests=false -Dtest=MultiTableTransactionITTest#testEndToEndMultiPartition`。详见 [AGENT.md](../AGENT.md) §3.1。
+**单方法 + 短超时**：`-Dtest=MultiTableTransactionITTest#<方法名>`。Surefire 的 `forkedProcessTimeoutInSeconds` 在 3.2.x 上**不可靠**（[SUREFIRE-1722](https://issues.apache.org/jira/browse/SUREFIRE-1722)），请用 GNU **`timeout 60s mvn ...`** 包住 `mvn test`（仅测试阶段，SDK `install` 可放在 `timeout` 外）。详见 [AGENT.md](../AGENT.md) §3.1。
 
 ### 3.3 Stream Load SDK 测试
 

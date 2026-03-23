@@ -652,21 +652,6 @@ limitations under the License.
                 </plugins>
             </build>
         </profile>
-        <profile>
-            <id>it-fork-timeout-60s</id>
-            <build>
-                <plugins>
-                    <plugin>
-                        <groupId>org.apache.maven.plugins</groupId>
-                        <artifactId>maven-surefire-plugin</artifactId>
-                        <configuration>
-                            <!-- Kill stuck fork after 60s (per JVM run); use when bisecting ITs: mvn test -Pit-fork-timeout-60s -Dtest=Class#method -->
-                            <forkedProcessTimeoutInSeconds>60</forkedProcessTimeoutInSeconds>
-                        </configuration>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
     </profiles>
 
     <repositories>

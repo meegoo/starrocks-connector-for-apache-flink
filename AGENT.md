@@ -63,11 +63,14 @@ mvn -B test -DskipTests=false -Dtest=MultiTableTransactionITTest
 mvn -B test -DskipTests=false -Dtest=MultiTableTransactionITTest#testEndToEndMultiPartition
 ```
 
-**60 秒超时**（避免单测卡死久等）：启用 profile `it-fork-timeout-60s`，由 Surefire 在超时后终止 fork 进程（正常用例应远小于 60s；超时即视为卡住或环境异常）。
+**约 60 秒硬超时**（避免单测卡死久等）：Surefire 3.2.x 的 `forkedProcessTimeoutInSeconds` 在部分版本**无法可靠杀掉**卡住的 fork JVM（见 Apache Surefire [SUREFIRE-1722](https://issues.apache.org/jira/browse/SUREFIRE-1722)）。请用 **GNU `timeout`** 包住**仅** `mvn test` 这一行（Linux / 远程节点通常可用）：
 
 ```bash
-mvn -B test -Pit-fork-timeout-60s -DskipTests=false -Dtest=MultiTableTransactionITTest#testNoFlushBeforeTxnEnd
+cd starrocks-stream-load-sdk && mvn -B install -Dmaven.javadoc.skip=true -DskipTests && cd .. && \
+  timeout 60s mvn -B test -DskipTests=false -Dtest=MultiTableTransactionITTest#testNoFlushBeforeTxnEnd
 ```
+
+`timeout` 到期会发信号结束 Maven 及其子进程；退出码 **124** 表示超时。需要更宽裕可把 `60s` 改为 `120s`。
 
 个别方法可能带 `@Ignore`（如 `testCheckpointTriggeredFlushDataIntegrity`），以当前源码为准。
 
