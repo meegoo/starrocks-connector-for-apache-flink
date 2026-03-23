@@ -57,6 +57,18 @@ cd starrocks-stream-load-sdk && mvn -B install -Dmaven.javadoc.skip=true -DskipT
 mvn -B test -DskipTests=false -Dtest=MultiTableTransactionITTest
 ```
 
+**逐个方法运行**（定位卡住用例）：Surefire 支持方法级过滤。
+
+```bash
+mvn -B test -DskipTests=false -Dtest=MultiTableTransactionITTest#testEndToEndMultiPartition
+```
+
+**60 秒超时**（避免单测卡死久等）：启用 profile `it-fork-timeout-60s`，由 Surefire 在超时后终止 fork 进程（正常用例应远小于 60s；超时即视为卡住或环境异常）。
+
+```bash
+mvn -B test -Pit-fork-timeout-60s -DskipTests=false -Dtest=MultiTableTransactionITTest#testNoFlushBeforeTxnEnd
+```
+
 个别方法可能带 `@Ignore`（如 `testCheckpointTriggeredFlushDataIntegrity`），以当前源码为准。
 
 ### 3.2 非 multi-table IT（**不含 Kafka**）

@@ -150,6 +150,8 @@ cd starrocks-stream-load-sdk && mvn -B install -Dmaven.javadoc.skip=true -DskipT
 mvn -B test -DskipTests=false -Dtest=MultiTableTransactionITTest
 ```
 
+**单方法 + 短超时**：`-Dtest=MultiTableTransactionITTest#<方法名>`；fork 进程超过 60s 时由 Maven profile `it-fork-timeout-60s` 终止（见根 `pom.xml`）。示例：`mvn -B test -Pit-fork-timeout-60s -DskipTests=false -Dtest=MultiTableTransactionITTest#testEndToEndMultiPartition`。详见 [AGENT.md](../AGENT.md) §3.1。
+
 ### 3.3 Stream Load SDK 测试
 
 ```bash
