@@ -54,6 +54,9 @@ public class SharedTransactionCoordinator {
     private String database;
     private String table;
 
+    /** Tracks whether any HTTP load was sent under the current shared label. */
+    private boolean dataLoaded;
+
     public SharedTransactionCoordinator(StreamLoader streamLoader,
                                         LabelGeneratorFactory labelGeneratorFactory) {
         this.streamLoader = streamLoader;
@@ -79,12 +82,29 @@ public class SharedTransactionCoordinator {
         LOG.info("[MultiTxn] SharedTransaction begin: label={}, db={}, table={}",
                 sharedLabel, database, anyTable);
 
+        this.dataLoaded = false;
+
         boolean ok = streamLoader.beginTransaction(sharedLabel, database, anyTable);
         if (!ok) {
             throw new StreamLoadFailException(
                     "Failed to begin shared transaction, label: " + sharedLabel +
                     ", db: " + database + ", table: " + anyTable);
         }
+    }
+
+    /**
+     * Marks that at least one HTTP load has been sent under the current shared label.
+     * Called by the manager when a region triggers a load.
+     */
+    public synchronized void markDataLoaded() {
+        this.dataLoaded = true;
+    }
+
+    /**
+     * Returns {@code true} if any data has been loaded under the current shared label.
+     */
+    public synchronized boolean hasDataLoaded() {
+        return dataLoaded;
     }
 
     /**
@@ -128,6 +148,7 @@ public class SharedTransactionCoordinator {
         this.sharedLabel = null;
         this.database = null;
         this.table = null;
+        this.dataLoaded = false;
     }
 
     public synchronized String getSharedLabel() {
@@ -159,5 +180,6 @@ public class SharedTransactionCoordinator {
         this.sharedLabel = null;
         this.database = null;
         this.table = null;
+        this.dataLoaded = false;
     }
 }
