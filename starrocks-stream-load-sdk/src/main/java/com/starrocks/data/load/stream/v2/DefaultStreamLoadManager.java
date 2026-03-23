@@ -210,8 +210,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     }
 
                     if (savepoint) {
-                        if (multiTableTransactionEnabled && txnCoordinator != null && txnCoordinator.isActive()) {
-                            LOG.info("[MultiTxn] Savepoint with active shared transaction; completing before savepoint");
+                        if (multiTableTransactionEnabled && txnCoordinator != null) {
+                            LOG.info("[MultiTxn] Savepoint in multi-table mode; txnCoordinator.isActive={}",
+                                    txnCoordinator.isActive());
                             // Wait for any in-flight loads to complete
                             for (TransactionTableRegion region : flushQ) {
                                 Future<?> result = region.getResult();
@@ -232,6 +233,28 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             for (TransactionTableRegion region : flushQ) {
                                 region.switchChunkForCommit();
                             }
+
+                            // If no shared transaction is active yet (e.g. flush() was
+                            // called before any txnEnd arrived), begin one now and inject
+                            // the shared label into all regions so their loads participate
+                            // in the same StarRocks transaction.
+                            if (!txnCoordinator.isActive()) {
+                                String beginDb = null;
+                                String beginTable = null;
+                                for (TransactionTableRegion region : flushQ) {
+                                    if (beginDb == null) {
+                                        beginDb = region.getDatabase();
+                                        beginTable = region.getTable();
+                                    }
+                                }
+                                if (beginDb != null) {
+                                    txnCoordinator.begin(beginDb, beginTable);
+                                    for (TransactionTableRegion region : flushQ) {
+                                        region.setLabel(txnCoordinator.getSharedLabel());
+                                    }
+                                }
+                            }
+
                             // Trigger loads for regions with pending data that haven't loaded yet
                             for (TransactionTableRegion region : flushQ) {
                                 region.triggerLoadIfNeeded();
@@ -260,7 +283,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     anyTable = region.getTable();
                                 }
                             }
-                            if (allLoadsDone && anyTable != null) {
+                            if (allLoadsDone && anyTable != null && txnCoordinator.isActive()) {
                                 try {
                                     txnCoordinator.prepareAndCommit(anyTable);
                                     LOG.info("[MultiTxn] Shared transaction committed during savepoint");
@@ -269,6 +292,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     LOG.error("[MultiTxn] Failed to commit shared transaction during savepoint", ex);
                                     this.e = ex;
                                 }
+                            } else if (!txnCoordinator.isActive() && flushQ.isEmpty()) {
+                                // No regions at all — nothing to commit
+                                allRegionsCommitted = true;
                             }
                             txnCoordinator.reset();
                             commitInFlight.set(false);
@@ -324,7 +350,10 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                         // Normal timer-driven path (non-multi-table, or multi-table between commits)
                         for (TransactionTableRegion region : flushQ) {
                             region.getAndIncrementAge();
-                            if (flushAndCommitStrategy.shouldCommit(region)) {
+                            // In multi-table transaction mode, individual region commits must NOT
+                            // happen — they would break cross-table atomicity. Only the shared
+                            // coordinator path (commitInFlight=true) is allowed to commit.
+                            if (!multiTableTransactionEnabled && flushAndCommitStrategy.shouldCommit(region)) {
                                 boolean success = region.commit();
                                 if (success) {
                                     region.resetAge();
