@@ -219,6 +219,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
                     if (savepoint) {
                         if (multiTableTransactionEnabled && txnCoordinator != null) {
+                          try {
                             LOG.info("[MultiTxn] Savepoint: completing shared transaction");
 
                             // Ensure a shared transaction is open (may not be if no data
@@ -289,6 +290,10 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 // No regions at all — nothing to commit
                                 allRegionsCommitted = true;
                             }
+                          } catch (Exception ex) {
+                            LOG.error("[MultiTxn] Savepoint shared transaction failed", ex);
+                            this.e = ex;
+                          } finally {
                             if (txnCoordinator.isActive()) {
                                 txnCoordinator.reset();
                             }
@@ -301,6 +306,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     region.setLabel(null);
                                 }
                             }
+                          }
                         } else {
                             // Non-multi-table path: flush and commit each region independently.
                             // This block must NOT run after a multi-table savepoint commit,
@@ -630,6 +636,13 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
      * manager thread when no region is actively flushing.
      */
     private void recycleSharedTransaction() {
+        // Do not recycle if a commit cycle is pending — the switched chunks
+        // must be committed under the current shared transaction to preserve atomicity.
+        if (commitInFlight.get()) {
+            LOG.debug("[MultiTxn] Cannot recycle shared txn: commitInFlight=true");
+            return;
+        }
+
         // Wait for any in-flight loads before recycling.
         for (TransactionTableRegion region : flushQ) {
             if (region.isFlushing() || region.isRetrying()) {
@@ -907,6 +920,14 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         if (state.compareAndSet(State.ACTIVE, State.INACTIVE)) {
             LOG.info("StreamLoadManagerV2 close, loadMetrics: {}, flushAndCommit: {}",
                     loadMetrics, flushAndCommitStrategy);
+            // Clean up the shared transaction to avoid server-side timeout warnings.
+            if (txnCoordinator != null && txnCoordinator.isActive()) {
+                try {
+                    txnCoordinator.reset();
+                } catch (Exception ex) {
+                    LOG.warn("Failed to rollback shared transaction during close", ex);
+                }
+            }
             manager.interrupt();
             streamLoader.close();
         }
