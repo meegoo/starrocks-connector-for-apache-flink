@@ -297,8 +297,8 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      *   t=0              txn-1 data emitted
      *   t=2×interval     assert EMPTY  (no txnEnd yet)
      *   t=2×interval     emit txn-1 txnEnd → commit
-     *   t=2×interval+Δ   assert 1 row  (txn-1 visible, txn-2 not started)
-     *   t=...            txn-2 data emitted (commitInFlight re-armed to false)
+     *   t=2×interval+Δ   assert 1 row  (txn-1 visible)
+     *   t=2×interval+Δ   release TXN1_COMMITTED_LATCH → txn-2 data emitted
      *   t=...+2×interval assert still 1 row (txn-2 data buffered, no txnEnd)
      *   t=...            emit txn-2 txnEnd → commit
      *   t=...+Δ          assert 2 rows (both txns visible)
@@ -346,6 +346,9 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             verifyResult(
                     Arrays.asList(Arrays.asList(1L, 100L, new BigDecimal("10.00"), "created")),
                     afterTxn1);
+
+            // Allow the source to emit txn-2 data now that txn-1 is verified
+            MultiTxnControlledSource.TXN1_COMMITTED_LATCH.countDown();
 
             // ---- Phase 2: txn-2 data emitted, no txnEnd yet ----
             // commitInFlight was reset to false after txn-1 commit
@@ -713,6 +716,8 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         static volatile CountDownLatch TXN1_END_LATCH;
         static volatile CountDownLatch TXN1_END_EMITTED_LATCH;
+        /** Gate: test releases after verifying txn-1 committed, so txn-2 data is not emitted during the commit cycle. */
+        static volatile CountDownLatch TXN1_COMMITTED_LATCH;
         static volatile CountDownLatch TXN2_END_LATCH;
         static volatile CountDownLatch TXN2_END_EMITTED_LATCH;
         static volatile String DB;
@@ -723,6 +728,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             ORDERS_TABLE = ordersTable;
             TXN1_END_LATCH          = new CountDownLatch(1);
             TXN1_END_EMITTED_LATCH  = new CountDownLatch(1);
+            TXN1_COMMITTED_LATCH    = new CountDownLatch(1);
             TXN2_END_LATCH          = new CountDownLatch(1);
             TXN2_END_EMITTED_LATCH  = new CountDownLatch(1);
         }
@@ -738,6 +744,11 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));  // txn-1 end
             TXN1_END_EMITTED_LATCH.countDown();
 
+            // Wait until the test confirms txn-1 committed before emitting txn-2 data.
+            // Without this gate, txn-2 data can arrive during the txn-1 commit cycle
+            // and be swept into the same shared transaction by a checkpoint savepoint.
+            TXN1_COMMITTED_LATCH.await();
+
             // txn-2 data (commitInFlight re-armed to false after txn-1 commit)
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":2,\"customer_id\":101,\"total_amount\":20.00,\"order_status\":\"created\"}",
@@ -751,8 +762,10 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         @Override
         public void cancel() {
             CountDownLatch l1 = TXN1_END_LATCH;
+            CountDownLatch lc = TXN1_COMMITTED_LATCH;
             CountDownLatch l2 = TXN2_END_LATCH;
             if (l1 != null) l1.countDown();
+            if (lc != null) lc.countDown();
             if (l2 != null) l2.countDown();
         }
     }
