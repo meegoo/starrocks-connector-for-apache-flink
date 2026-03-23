@@ -115,6 +115,12 @@ public class TransactionTableRegion implements TableRegion {
 
     private void initHeaders(StreamLoadTableProperties properties) {
         headers.putAll(properties.getProperties());
+        // Include db and table headers so that transaction stream load
+        // (/api/transaction/load) routes data to the correct table.
+        // In multi-table transaction mode, each region targets a different
+        // table under the same shared label, so these headers are required.
+        headers.put("db", database);
+        headers.put("table", table);
         Optional<String> compressionType = properties.getProperty("compression");
         // To enable csv compression, at the connector side, the user need to set two properties:
         // "format = csv" and "compression = <compression type>". It needs to be converted to one
