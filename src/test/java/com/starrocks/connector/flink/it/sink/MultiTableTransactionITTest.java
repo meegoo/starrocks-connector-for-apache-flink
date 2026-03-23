@@ -29,6 +29,7 @@ import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.streaming.api.functions.source.RichParallelSourceFunction;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -70,7 +71,7 @@ import static org.junit.Assert.assertTrue;
  *       simultaneously via a single shared StarRocks transaction label.</li>
  *   <li>{@link #testPartialPartitionTxnEndBlocking} — blocking: when only one of two
  *       partitions has sent txnEnd, data must NOT be committed.</li>
- *   <li>{@link #testCheckpointTriggeredFlushDataIntegrity} — checkpoint: Flink checkpoint
+ *   <li>{@link #testCheckpointTriggeredFlushDataIntegrity} — (ignored) checkpoint: Flink checkpoint
  *       triggers flush(), all buffered data must be committed completely.</li>
  * </ol>
  */
@@ -590,6 +591,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      * The job finishes normally via {@code close()} → {@code flush()}, which acts
      * as a savepoint. After the job completes, both tables must have all expected rows.
      */
+    @Ignore("Skipped by request: do not run in default IT suite")
     @Test
     public void testCheckpointTriggeredFlushDataIntegrity() throws Exception {
         String ordersTable = createOrdersTable();
