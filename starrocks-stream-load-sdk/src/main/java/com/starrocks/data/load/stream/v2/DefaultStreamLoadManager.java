@@ -104,6 +104,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     private volatile boolean savepoint = false;
     private volatile boolean allRegionsCommitted;
     private long flushTimeoutMs = 660000L; // default stream load timeout is 600s, 1.1x for flush
+    /**
+     * Maximum time (ms) a shared transaction can stay open before being proactively
+     * recycled to avoid StarRocks server-side timeout. Defaults to 80% of 600s = 480s.
+     */
+    private long sharedTxnMaxIdleMs = 480_000L;
 
     private final AtomicBoolean commitInFlight = new AtomicBoolean(false);
 
@@ -168,7 +173,10 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         String timeoutStr = properties.getHeaders().get("timeout");
         if (timeoutStr != null) {
             try {
-                this.flushTimeoutMs = Long.parseLong(timeoutStr) * 1100; // 1.1x for flush
+                long timeoutSec = Long.parseLong(timeoutStr);
+                this.flushTimeoutMs = timeoutSec * 1100; // 1.1x for flush
+                // 80% of server-side timeout as safety margin for shared transaction recycling
+                this.sharedTxnMaxIdleMs = timeoutSec * 800;
             } catch (NumberFormatException ex) {
                 LOG.warn("Invalid timeout value in properties header: {}, using default", timeoutStr);
             }
@@ -338,9 +346,23 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                         // that autonomous flushes use the shared label instead of independent labels.
                         // This eliminates the data-loss window where an independent-label flush
                         // could be orphaned when a shared transaction later overwrites the label.
-                        if (multiTableTransactionEnabled && txnCoordinator != null
-                                && !txnCoordinator.isActive() && !flushQ.isEmpty()) {
-                            ensureSharedTransaction();
+                        if (multiTableTransactionEnabled && txnCoordinator != null && !flushQ.isEmpty()) {
+                            if (!txnCoordinator.isActive()) {
+                                try {
+                                    ensureSharedTransaction();
+                                } catch (Exception beginEx) {
+                                    LOG.error("[MultiTxn] Failed to eagerly open shared transaction", beginEx);
+                                    this.e = beginEx;
+                                }
+                            } else if (txnCoordinator.getElapsedMs() >= sharedTxnMaxIdleMs) {
+                                // Recycle the shared transaction before server-side timeout.
+                                try {
+                                    recycleSharedTransaction();
+                                } catch (Exception recycleEx) {
+                                    LOG.error("[MultiTxn] Failed to recycle shared transaction", recycleEx);
+                                    this.e = recycleEx;
+                                }
+                            }
                         }
 
                         for (TransactionTableRegion region : flushQ) {
@@ -523,8 +545,20 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
             // Immediately open a new shared transaction for the next cycle,
             // so any subsequent autonomous flushes are under the new shared label.
+            // This is best-effort: if it fails, the normal path will retry on the next scan.
             if (!flushQ.isEmpty()) {
-                ensureSharedTransaction();
+                try {
+                    ensureSharedTransaction();
+                } catch (Exception beginEx) {
+                    LOG.warn("[MultiTxn] Failed to eagerly open next shared transaction after commit; " +
+                            "will retry on next scan: {}", beginEx.getMessage());
+                    txnCoordinator.reset();
+                    for (TransactionTableRegion region : regionSnapshot) {
+                        if (!region.isRetrying()) {
+                            region.setLabel(null);
+                        }
+                    }
+                }
             }
         } catch (Exception ex) {
             LOG.error("[MultiTxn] Shared transaction commit failed", ex);
@@ -563,13 +597,71 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             return;
         }
 
+        // Ensure no region is retrying — setLabel() throws if numRetries > 0.
+        for (TransactionTableRegion region : flushQ) {
+            if (region.isFlushing() || region.isRetrying()) {
+                LOG.debug("[MultiTxn] Cannot open shared txn: region {} is flushing/retrying",
+                        region.getUniqueKey());
+                return;
+            }
+        }
+
         txnCoordinator.begin(anyDb, anyTable);
 
         for (TransactionTableRegion region : flushQ) {
-            region.setLabel(txnCoordinator.getSharedLabel());
+            try {
+                region.setLabel(txnCoordinator.getSharedLabel());
+            } catch (IllegalStateException ex) {
+                // Region started retrying between the check and setLabel (narrow race).
+                // Roll back and let the next scan retry.
+                LOG.warn("[MultiTxn] Region {} started retrying during ensureSharedTransaction; " +
+                        "rolling back: {}", region.getUniqueKey(), ex.getMessage());
+                txnCoordinator.reset();
+                return;
+            }
         }
         LOG.info("[MultiTxn] Eagerly opened shared transaction: label={}",
                 txnCoordinator.getSharedLabel());
+    }
+
+    /**
+     * Recycles (commit-or-rollback + reopen) the current shared transaction to prevent
+     * it from hitting the StarRocks server-side timeout. Must only be called from the
+     * manager thread when no region is actively flushing.
+     */
+    private void recycleSharedTransaction() {
+        // Wait for any in-flight loads before recycling.
+        for (TransactionTableRegion region : flushQ) {
+            if (region.isFlushing() || region.isRetrying()) {
+                LOG.debug("[MultiTxn] Cannot recycle shared txn: region {} still flushing/retrying",
+                        region.getUniqueKey());
+                return;
+            }
+        }
+
+        LOG.info("[MultiTxn] Recycling shared transaction approaching timeout: label={}, elapsed={}ms",
+                txnCoordinator.getSharedLabel(), txnCoordinator.getElapsedMs());
+
+        String anyTable = null;
+        for (TransactionTableRegion region : flushQ) {
+            if (anyTable == null) {
+                anyTable = region.getTable();
+            }
+        }
+
+        if (anyTable != null && txnCoordinator.hasDataLoaded()) {
+            txnCoordinator.prepareAndCommit(anyTable);
+            LOG.info("[MultiTxn] Recycled shared transaction committed");
+        } else {
+            txnCoordinator.reset();
+            LOG.info("[MultiTxn] Recycled empty shared transaction (rolled back)");
+        }
+
+        // Clear labels and open a fresh shared transaction.
+        for (TransactionTableRegion region : flushQ) {
+            region.setLabel(null);
+        }
+        ensureSharedTransaction();
     }
 
     public void setStreamLoadListener(StreamLoadListener streamLoadListener) {
@@ -639,12 +731,6 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             totalFlushRows.addAndGet(response.getFlushRows());
         }
         writeTriggerFlush.set(false);
-
-        // Track that data was loaded under the shared transaction (covers autonomous flushes).
-        if (multiTableTransactionEnabled && txnCoordinator != null
-                && txnCoordinator.isActive() && response.getException() == null) {
-            txnCoordinator.markDataLoaded();
-        }
 
         LOG.debug("Receive load response, cacheByteBeforeFlush: {}, currentCacheBytes: {}, totalFlushRows : {}",
                 cacheByteBeforeFlush, currentCacheBytes.get(), totalFlushRows.get());

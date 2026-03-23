@@ -57,6 +57,9 @@ public class SharedTransactionCoordinator {
     /** Tracks whether any HTTP load was sent under the current shared label. */
     private boolean dataLoaded;
 
+    /** Timestamp (millis) when the current shared transaction was opened. */
+    private long beginTimeMs;
+
     public SharedTransactionCoordinator(StreamLoader streamLoader,
                                         LabelGeneratorFactory labelGeneratorFactory) {
         this.streamLoader = streamLoader;
@@ -83,6 +86,7 @@ public class SharedTransactionCoordinator {
                 sharedLabel, database, anyTable);
 
         this.dataLoaded = false;
+        this.beginTimeMs = System.currentTimeMillis();
 
         boolean ok = streamLoader.beginTransaction(sharedLabel, database, anyTable);
         if (!ok) {
@@ -157,6 +161,14 @@ public class SharedTransactionCoordinator {
 
     public synchronized boolean isActive() {
         return sharedLabel != null;
+    }
+
+    /**
+     * Returns the elapsed time in milliseconds since the shared transaction was opened.
+     * Returns 0 if no transaction is active.
+     */
+    public synchronized long getElapsedMs() {
+        return sharedLabel != null ? System.currentTimeMillis() - beginTimeMs : 0;
     }
 
     /**
