@@ -72,6 +72,8 @@ cd starrocks-stream-load-sdk && mvn -B install -Dmaven.javadoc.skip=true -DskipT
 
 `timeout` 到期会发信号结束 Maven 及其子进程；退出码 **124** 表示超时。需要更宽裕可把 `60s` 改为 `120s`。
 
+`testEndToEndMultiPartition` 等若在主线程直接 `env.execute()`，作业卡死会导致 Surefire 长时间不打印 `[INFO] Results:`。当前实现通过 `runFlinkJobWithTimeout`（默认 **120s**）在子线程执行 `execute` 并在超时后失败断言，便于与 `timeout` 命令配合定位。
+
 个别方法可能带 `@Ignore`（如 `testCheckpointTriggeredFlushDataIntegrity`），以当前源码为准。
 
 ### 3.2 非 multi-table IT（**不含 Kafka**）

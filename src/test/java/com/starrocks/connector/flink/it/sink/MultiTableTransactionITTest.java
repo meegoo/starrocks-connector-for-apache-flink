@@ -39,6 +39,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static com.starrocks.connector.flink.it.sink.StarRocksTableUtils.scanTable;
 import static com.starrocks.connector.flink.it.sink.StarRocksTableUtils.verifyResult;
@@ -95,6 +96,13 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      * We add a 2 s buffer for CI/network variance.
      */
     private static final long COMMIT_PROPAGATION_MS = 2_000L;
+
+    /**
+     * Max time to wait for {@link StreamExecutionEnvironment#execute(String)} when it runs
+     * on the test thread's behalf in a worker thread. Prevents an indefinite hang (no Surefire
+     * "[INFO] Results:") if the Flink job or sink never completes.
+     */
+    private static final long FLINK_EXECUTE_TIMEOUT_MS = 120_000L;
 
     // -------------------------------------------------------------------------
     // DDL helpers
@@ -183,7 +191,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                 .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
                 .setParallelism(2);
 
-        env.execute("testEndToEndMultiPartition");
+        runFlinkJobWithTimeout(env, "testEndToEndMultiPartition");
 
         verifyResult(
                 Arrays.asList(
@@ -393,7 +401,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                 .keyBy(DefaultStarRocksRowData::getSourcePartition)
                 .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS));
 
-        env.execute("testEmptyTransaction");
+        runFlinkJobWithTimeout(env, "testEmptyTransaction");
 
         assertEquals("orders must be empty after empty transaction",
                 0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
@@ -622,8 +630,8 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                 .addSink(buildSink(ordersTable, orderItemsTable, largeFlushInterval))
                 .setParallelism(1);
 
-        // Execute synchronously — close() triggers flush()
-        env.execute("testCheckpointTriggeredFlushDataIntegrity");
+        // close() triggers flush(); bounded wait so a hang still yields a test failure + Results
+        runFlinkJobWithTimeout(env, "testCheckpointTriggeredFlushDataIntegrity");
 
         // All data must be committed by the savepoint path
         List<List<Object>> ordersAfter = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
@@ -875,6 +883,40 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         env.setParallelism(parallelism);
         env.enableCheckpointing(5_000);
         return env;
+    }
+
+    /**
+     * Runs {@code env.execute(jobName)} on a separate thread and fails if it does not return
+     * within {@link #FLINK_EXECUTE_TIMEOUT_MS}. Avoids blocking the Surefire thread forever
+     * when the job deadlocks.
+     */
+    private void runFlinkJobWithTimeout(StreamExecutionEnvironment env, String jobName) throws Exception {
+        AtomicReference<Throwable> executionError = new AtomicReference<>();
+        Thread jobThread = new Thread(() -> {
+            try {
+                env.execute(jobName);
+            } catch (Throwable t) {
+                executionError.set(t);
+            }
+        }, "flink-job-" + jobName);
+        jobThread.start();
+        jobThread.join(FLINK_EXECUTE_TIMEOUT_MS);
+        if (jobThread.isAlive()) {
+            jobThread.interrupt();
+            throw new AssertionError(String.format(
+                    "Flink job '%s' did not finish within %d ms (stuck in execute?); thread interrupted",
+                    jobName, FLINK_EXECUTE_TIMEOUT_MS));
+        }
+        Throwable t = executionError.get();
+        if (t != null) {
+            if (t instanceof Exception) {
+                throw (Exception) t;
+            }
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            throw new Exception(t);
+        }
     }
 
     private SinkFunction<DefaultStarRocksRowData> buildSink(
