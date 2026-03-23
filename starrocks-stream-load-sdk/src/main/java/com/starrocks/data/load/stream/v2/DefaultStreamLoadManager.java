@@ -160,6 +160,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             maxRetries = properties.getMaxRetries();
             retryIntervalInMs = properties.getRetryIntervalInMs();
         }
+        if (properties.isEnableMultiTableTransaction() && !(streamLoader instanceof TransactionStreamLoader)) {
+            throw new IllegalArgumentException(
+                    "Multi-table transaction mode requires TransactionStreamLoader. " +
+                    "Retry (maxRetries > 0) is not supported with multi-table transactions.");
+        }
         if (properties.isEnableMultiTableTransaction() && properties.getMultiTableTransactionBufferSize() > 0) {
             this.maxCacheBytes = properties.getMultiTableTransactionBufferSize();
         } else {
@@ -359,6 +364,8 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 } catch (Exception beginEx) {
                                     LOG.error("[MultiTxn] Failed to eagerly open shared transaction", beginEx);
                                     this.e = beginEx;
+                                    // Skip flush/commit to avoid creating orphan independent transactions.
+                                    continue;
                                 }
                             } else if (txnCoordinator.getElapsedMs() >= sharedTxnMaxIdleMs) {
                                 // Recycle the shared transaction before server-side timeout.
@@ -367,6 +374,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 } catch (Exception recycleEx) {
                                     LOG.error("[MultiTxn] Failed to recycle shared transaction", recycleEx);
                                     this.e = recycleEx;
+                                    continue;
                                 }
                             }
                         }
