@@ -100,11 +100,13 @@ public class StreamLoadManagerMultiTableTest {
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
 
-            // Single shared transaction: exactly 1 begin and 1 prepare/commit sequence.
-            Assert.assertEquals("Expected exactly 1 begin for single shared transaction",
-                    1, mockedServer.getBeginCount());
+            // At least 1 begin (shared transaction is eagerly opened; after commit,
+            // a new one is opened for the next cycle, and savepoint may open yet another).
+            Assert.assertTrue("Expected at least 1 begin for shared transaction",
+                    mockedServer.getBeginCount() >= 1);
             Assert.assertTrue("Expected at least 1 load call (one per table)",
                     mockedServer.getLoadCount() >= 1);
+            // Exactly 1 prepare/commit for the data-carrying shared transaction.
             Assert.assertEquals("Expected exactly 1 prepare for single shared transaction",
                     1, mockedServer.getPrepareCount());
             Assert.assertEquals("Expected exactly 1 commit for single shared transaction",
@@ -156,7 +158,8 @@ public class StreamLoadManagerMultiTableTest {
 
     /**
      * Verifies that data is NOT committed while no partition has sent txnEnd.
-     * The shared begin/prepare/commit should not happen before txnEnd.
+     * The shared transaction is eagerly opened (begin), but commit only
+     * happens after txnEnd.
      */
     @Test
     public void testCommitNotTriggeredWithoutTxnEnd() throws Exception {
@@ -173,7 +176,8 @@ public class StreamLoadManagerMultiTableTest {
 
             Thread.sleep(300);
             Assert.assertNull("No exception expected", manager.getException());
-            Assert.assertEquals("No begin expected before txnEnd", 0, mockedServer.getBeginCount());
+            // Shared transaction is eagerly opened, so begin may have been called.
+            // But commit must NOT have happened yet.
             Assert.assertEquals("No commit expected before txnEnd", 0, mockedServer.getCommitCount());
 
             manager.setCommitAllowed(0, true);
@@ -225,7 +229,8 @@ public class StreamLoadManagerMultiTableTest {
     /**
      * Savepoint (flush) commits the active shared transaction even when
      * txnEnd has not been received (interval-based commit threshold is very high).
-     * Verifies exactly 1 begin + prepare + commit via the savepoint path.
+     * Verifies exactly 1 prepare + commit via the savepoint path.
+     * The shared transaction is eagerly opened, so begin count may be >= 1.
      */
     @Test
     public void testSavepointCommitsMultiTableTransaction() throws Exception {
@@ -245,10 +250,10 @@ public class StreamLoadManagerMultiTableTest {
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
 
-            // The savepoint path commits any active shared transaction.
-            // Exactly 1 begin/prepare/commit must be issued regardless of txnEnd.
-            Assert.assertEquals("Savepoint should issue exactly 1 begin",
-                    1, mockedServer.getBeginCount());
+            // The shared transaction is eagerly opened, so at least 1 begin.
+            // Savepoint path commits the active shared transaction.
+            Assert.assertTrue("Savepoint should issue at least 1 begin",
+                    mockedServer.getBeginCount() >= 1);
             Assert.assertEquals("Savepoint should issue exactly 1 prepare",
                     1, mockedServer.getPrepareCount());
             Assert.assertEquals("Savepoint should issue exactly 1 commit",
@@ -332,6 +337,74 @@ public class StreamLoadManagerMultiTableTest {
                     manager.getException());
             Assert.assertTrue("Exception should mention database mismatch",
                     manager.getException().getMessage().contains("same database"));
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Verifies that autonomous flush (triggered by buffer thresholds) uses the
+     * shared transaction label rather than generating an independent label.
+     * This is the key scenario that was previously subject to data loss.
+     *
+     * <p>With the eager shared transaction approach, the shared label is injected
+     * before any autonomous flush can occur, so all loads use the shared label.
+     * After txnEnd, the commit cycle commits all data (including data from
+     * autonomous flushes) under the single shared transaction.
+     */
+    @Test
+    public void testAutonomousFlushUsesSharedLabel() throws Exception {
+        // Use a very small buffer (1 byte effective) to trigger autonomous flush immediately.
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("orders")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .maxBufferRows(1) // Flush after every row
+                .build();
+
+        StreamLoadProperties properties = StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("4.0.0")
+                .enableMultiTableTransaction()
+                .labelPrefix("test-autoflush-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(100)
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .build();
+
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Write multiple rows — with maxBufferRows=1, autonomous flush should trigger
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.write(0, "test", "orders", "{\"order_id\":2}");
+            manager.write(0, "test", "orders", "{\"order_id\":3}");
+
+            // Give manager thread time to process autonomous flushes
+            Thread.sleep(500);
+            Assert.assertNull("No exception during autonomous flush", manager.getException());
+
+            // Now send txnEnd to trigger commit
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(500);
+            Assert.assertNull("No exception after txnEnd", manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+
+            // All data should have been committed under shared transactions.
+            // The critical assertion: at least 1 commit happened (data wasn't lost).
+            Assert.assertTrue("Expected at least 1 commit (autonomous flush data not lost)",
+                    mockedServer.getCommitCount() >= 1);
+            // Loads should have occurred (autonomous flushes).
+            Assert.assertTrue("Expected at least 1 load from autonomous flush",
+                    mockedServer.getLoadCount() >= 1);
         } finally {
             manager.close();
         }

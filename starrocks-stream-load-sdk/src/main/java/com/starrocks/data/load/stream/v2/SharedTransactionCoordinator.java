@@ -54,6 +54,12 @@ public class SharedTransactionCoordinator {
     private String database;
     private String table;
 
+    /** Tracks whether any HTTP load was sent under the current shared label. */
+    private boolean dataLoaded;
+
+    /** Timestamp (millis) when the current shared transaction was opened. */
+    private long beginTimeMs;
+
     public SharedTransactionCoordinator(StreamLoader streamLoader,
                                         LabelGeneratorFactory labelGeneratorFactory) {
         this.streamLoader = streamLoader;
@@ -79,12 +85,30 @@ public class SharedTransactionCoordinator {
         LOG.info("[MultiTxn] SharedTransaction begin: label={}, db={}, table={}",
                 sharedLabel, database, anyTable);
 
+        this.dataLoaded = false;
+        this.beginTimeMs = System.currentTimeMillis();
+
         boolean ok = streamLoader.beginTransaction(sharedLabel, database, anyTable);
         if (!ok) {
             throw new StreamLoadFailException(
                     "Failed to begin shared transaction, label: " + sharedLabel +
                     ", db: " + database + ", table: " + anyTable);
         }
+    }
+
+    /**
+     * Marks that at least one HTTP load has been sent under the current shared label.
+     * Called by the manager when a region triggers a load.
+     */
+    public synchronized void markDataLoaded() {
+        this.dataLoaded = true;
+    }
+
+    /**
+     * Returns {@code true} if any data has been loaded under the current shared label.
+     */
+    public synchronized boolean hasDataLoaded() {
+        return dataLoaded;
     }
 
     /**
@@ -128,6 +152,7 @@ public class SharedTransactionCoordinator {
         this.sharedLabel = null;
         this.database = null;
         this.table = null;
+        this.dataLoaded = false;
     }
 
     public synchronized String getSharedLabel() {
@@ -136,6 +161,14 @@ public class SharedTransactionCoordinator {
 
     public synchronized boolean isActive() {
         return sharedLabel != null;
+    }
+
+    /**
+     * Returns the elapsed time in milliseconds since the shared transaction was opened.
+     * Returns 0 if no transaction is active.
+     */
+    public synchronized long getElapsedMs() {
+        return sharedLabel != null ? System.currentTimeMillis() - beginTimeMs : 0;
     }
 
     /**
@@ -159,5 +192,6 @@ public class SharedTransactionCoordinator {
         this.sharedLabel = null;
         this.database = null;
         this.table = null;
+        this.dataLoaded = false;
     }
 }
