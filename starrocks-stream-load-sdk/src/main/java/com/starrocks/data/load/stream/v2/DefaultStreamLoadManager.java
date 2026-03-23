@@ -210,8 +210,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     }
 
                     if (savepoint) {
-                        if (multiTableTransactionEnabled && txnCoordinator != null && txnCoordinator.isActive()) {
-                            LOG.info("[MultiTxn] Savepoint with active shared transaction; completing before savepoint");
+                        if (multiTableTransactionEnabled && txnCoordinator != null) {
+                            LOG.info("[MultiTxn] Savepoint in multi-table mode, coordinatorActive={}",
+                                    txnCoordinator.isActive());
                             // Wait for any in-flight loads to complete
                             for (TransactionTableRegion region : flushQ) {
                                 Future<?> result = region.getResult();
@@ -223,6 +224,30 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     }
                                 }
                             }
+
+                            // If no shared transaction is active yet, begin one now.
+                            // This handles the case where a checkpoint fires before all
+                            // partitions have sent txnEnd — data must still be committed
+                            // atomically through a shared transaction, not independently.
+                            if (!txnCoordinator.isActive()) {
+                                String anyDb = null;
+                                String anyTable = null;
+                                for (TransactionTableRegion region : flushQ) {
+                                    if (anyDb == null) {
+                                        anyDb = region.getDatabase();
+                                        anyTable = region.getTable();
+                                    }
+                                }
+                                if (anyDb != null) {
+                                    txnCoordinator.begin(anyDb, anyTable);
+                                    for (TransactionTableRegion region : flushQ) {
+                                        if (!region.isRetrying()) {
+                                            region.setLabel(txnCoordinator.getSharedLabel());
+                                        }
+                                    }
+                                }
+                            }
+
                             // Switch ALL regions' active chunks into inactive queues so
                             // that any residual data (e.g. from partitions that never
                             // reached txnEnd) is included in the shared transaction.

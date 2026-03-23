@@ -75,8 +75,17 @@ public class PartitionCommitTracker {
      * new data is not prematurely included in the current commit cycle.
      */
     public synchronized void onWrite(int partition) {
-        partitions.put(partition, PartitionState.ACTIVE);
+        PartitionState prev = partitions.put(partition, PartitionState.ACTIVE);
         pendingTxnEnd.remove(partition);
+        if (prev == null) {
+            // A brand-new partition just appeared.  Reset the commit timer so that
+            // isIntervalElapsed() returns false for at least one full commit interval.
+            // Without this, allSwitched() can return true prematurely when only a
+            // subset of partitions has been registered (e.g. P0 sends txnEnd before
+            // P1 has written any data, causing P0 to commit alone).
+            lastCommitTimeMs = System.currentTimeMillis();
+            LOG.debug("[MultiTxn] New partition {} registered, reset commit timer", partition);
+        }
     }
 
     /**
