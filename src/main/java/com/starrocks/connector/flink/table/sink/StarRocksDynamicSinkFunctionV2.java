@@ -141,13 +141,18 @@ public class StarRocksDynamicSinkFunctionV2<T> extends StarRocksDynamicSinkFunct
                         || Strings.isNullOrEmpty(data.getTable())
                         || data.getRow() == null) {
                     if (data.isTransactionEnd()) {
-                        log.debug("[MultiTxn] invoke: control-only txnEnd row, partition={}", partition);
+                        log.info("[MultiTxn] invoke: control-only txnEnd row, partition={}, db={}, table={}",
+                                partition, data.getDatabase(), data.getTable());
                         sinkManager.setCommitAllowed(partition, true);
                     }
                     return;
                 }
                 if (partition >= 0) {
                     sinkManager.write(partition, data.getDatabase(), data.getTable(), data.getRow());
+                    if (data.isTransactionEnd()) {
+                        log.info("[MultiTxn] invoke: data+txnEnd row, partition={}, db={}, table={}",
+                                partition, data.getDatabase(), data.getTable());
+                    }
                     sinkManager.setCommitAllowed(partition, data.isTransactionEnd());
                 } else {
                     sinkManager.write(data.getUniqueKey(), data.getDatabase(), data.getTable(), data.getRow());

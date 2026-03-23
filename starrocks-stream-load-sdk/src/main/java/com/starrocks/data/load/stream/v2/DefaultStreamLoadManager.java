@@ -219,7 +219,25 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
                     if (lastPrintTimestamp == -1 || System.currentTimeMillis() - lastPrintTimestamp > 10000) {
                         lastPrintTimestamp = System.currentTimeMillis();
-                        LOG.debug("Audit information: {}, {}", loadMetrics, flushAndCommitStrategy);
+                        LOG.info("Audit information: {}, {}", loadMetrics, flushAndCommitStrategy);
+                        if (multiTableTransactionEnabled) {
+                            LOG.info("[MultiTxn] ManagerLoop state: savepoint={}, commitInFlight={}, " +
+                                    "flushQ.size={}, currentCacheBytes={}, regions={}, " +
+                                    "txnCoordinator.active={}, txnCoordinator.label={}, " +
+                                    "partitionTracker={}",
+                                    savepoint, commitInFlight.get(),
+                                    flushQ.size(), currentCacheBytes.get(), regions.size(),
+                                    txnCoordinator != null && txnCoordinator.isActive(),
+                                    txnCoordinator != null ? txnCoordinator.getSharedLabel() : "null",
+                                    partitionTracker);
+                            for (TransactionTableRegion region : flushQ) {
+                                LOG.info("[MultiTxn]   Region: key={}, db={}, table={}, state={}, " +
+                                        "label={}, cacheBytes={}, retrying={}",
+                                        region.getUniqueKey(), region.getDatabase(), region.getTable(),
+                                        region.getStateForLog(), region.getLabel(),
+                                        region.getCacheBytes(), region.isRetrying());
+                            }
+                        }
                     }
 
                     if (savepoint) {
@@ -258,11 +276,20 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                             }
                             // Wait for triggered loads to complete.
                             boolean allLoadsDone = false;
+                            long savepointWaitStart = System.currentTimeMillis();
                             while (!allLoadsDone && this.e == null) {
                                 allLoadsDone = true;
                                 for (TransactionTableRegion region : flushQ) {
                                     if (region.isFlushing()) {
                                         allLoadsDone = false;
+                                        long waited = System.currentTimeMillis() - savepointWaitStart;
+                                        if (waited > 0 && waited % 5000 < 50) {
+                                            LOG.info("[MultiTxn] Savepoint: waiting for region {} " +
+                                                    "to finish flushing (state={}, label={}, " +
+                                                    "cacheBytes={}, waited={}ms)",
+                                                    region.getUniqueKey(), region.getStateForLog(),
+                                                    region.getLabel(), region.getCacheBytes(), waited);
+                                        }
                                         break;
                                     }
                                 }
@@ -270,6 +297,8 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     LockSupport.parkNanos(1_000_000L);
                                 }
                             }
+                            LOG.info("[MultiTxn] Savepoint: all loads done in {}ms",
+                                    System.currentTimeMillis() - savepointWaitStart);
                             // Commit or rollback
                             String anyTable = null;
                             for (TransactionTableRegion region : flushQ) {
@@ -463,7 +492,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // thread has processed all subsequent records and every partition is
         // registered in the tracker.
         partitionTracker.onTxnEnd(partition);
-        LOG.debug("[MultiTxn] txnEnd for partition={}", partition);
+        LOG.info("[MultiTxn] txnEnd received for partition={}, tracker={}", partition, partitionTracker);
     }
 
     /**
@@ -474,6 +503,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
      */
     private void trySwitchAndCommit() {
         List<Integer> readyPartitions = partitionTracker.getReadyToSwitch();
+        if (!readyPartitions.isEmpty()) {
+            LOG.info("[MultiTxn] trySwitchAndCommit: readyPartitions={}", readyPartitions);
+        }
         for (int p : readyPartitions) {
             List<TransactionTableRegion> pRegions = partitionRegions.get(p);
             if (pRegions != null) {
@@ -482,15 +514,16 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 }
             }
             partitionTracker.markSwitched(p);
-            LOG.debug("[MultiTxn] partition {} switched, regions={}", p,
+            LOG.info("[MultiTxn] partition {} switched, regions={}", p,
                     pRegions == null ? 0 : pRegions.size());
         }
 
-        if (partitionTracker.allSwitched() && commitInFlight.compareAndSet(false, true)) {
-            // No flushable.signal() needed — this method already runs on the
-            // manager thread.  The caller will see commitInFlight==true and
-            // `continue` to the next iteration which enters processMultiTableCommit().
-            LOG.info("[MultiTxn] All partitions switched, commitInFlight=true");
+        boolean allSwitched = partitionTracker.allSwitched();
+        if (allSwitched && commitInFlight.compareAndSet(false, true)) {
+            LOG.info("[MultiTxn] All partitions switched, commitInFlight=true, tracker={}",
+                    partitionTracker);
+        } else if (!readyPartitions.isEmpty() && !allSwitched) {
+            LOG.info("[MultiTxn] Not all partitions switched yet, tracker={}", partitionTracker);
         }
     }
 
@@ -510,10 +543,12 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
      * </ol>
      */
     private void processMultiTableCommit() {
+        LOG.info("[MultiTxn] processMultiTableCommit: entering, flushQ.size={}", flushQ.size());
         final List<TransactionTableRegion> regionSnapshot =
                 Collections.unmodifiableList(new ArrayList<>(flushQ));
         try {
             if (!txnCoordinator.isActive()) {
+                LOG.info("[MultiTxn] processMultiTableCommit: no active shared txn, opening one");
                 // Edge case: commitInFlight was set but no shared txn is open yet
                 // (e.g. first write + immediate txnEnd before manager thread ran).
                 // Ensure the shared transaction exists before proceeding.
@@ -523,8 +558,10 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             // Wait for any in-flight autonomous flushes to complete.
             for (TransactionTableRegion region : regionSnapshot) {
                 if (region.isFlushing() || region.isRetrying()) {
-                    LOG.debug("[MultiTxn] Region {} still flushing/retrying, will retry next scan",
-                            region.getUniqueKey());
+                    LOG.info("[MultiTxn] processMultiTableCommit: region {} still flushing/retrying " +
+                            "(state={}, label={}, cacheBytes={}), will retry next scan",
+                            region.getUniqueKey(), region.getStateForLog(),
+                            region.getLabel(), region.getCacheBytes());
                     return;
                 }
             }
@@ -546,6 +583,9 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             }
 
             // All loads are done. Commit.
+            LOG.info("[MultiTxn] processMultiTableCommit: all loads done, proceeding to commit. " +
+                    "hasDataLoaded={}, sharedLabel={}",
+                    txnCoordinator.hasDataLoaded(), txnCoordinator.getSharedLabel());
             String anyTable = null;
             for (TransactionTableRegion region : regionSnapshot) {
                 if (anyTable == null) {
@@ -821,22 +861,33 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
     @Override
     public void flush() {
-        LOG.info("Stream load manager flush start - currentCacheBytes: {}, maxCacheBytes: {}",
-                currentCacheBytes.get(), maxCacheBytes);
+        LOG.info("Stream load manager flush start - currentCacheBytes: {}, maxCacheBytes: {}, " +
+                "multiTableTxn={}, commitInFlight={}, flushQ.size={}",
+                currentCacheBytes.get(), maxCacheBytes,
+                multiTableTransactionEnabled, commitInFlight.get(), flushQ.size());
 
         initializeFlushState();
 
         long startTime = System.currentTimeMillis();
         long waitTime = 100; // Initial wait time: 100ms
+        int iteration = 0;
 
         try {
             while (!isSavepointFinished()) {
+                iteration++;
                 checkFlushTimeout(startTime);
+
+                LOG.info("flush() iteration={}, elapsed={}ms, currentCacheBytes={}, " +
+                        "allRegionsCommitted={}, savepoint={}, e={}",
+                        iteration, System.currentTimeMillis() - startTime,
+                        currentCacheBytes.get(), allRegionsCommitted, savepoint,
+                        e != null ? e.getMessage() : "null");
 
                 triggerFlushSignal();
                 LockSupport.park(current);
 
                 if (!savepoint) {
+                    LOG.info("flush() savepoint cleared after park, breaking loop");
                     break;
                 }
 
@@ -982,6 +1033,8 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         }
         String uniqueKey = "P" + partition + "-" + StreamLoadUtils.getTableUniqueKey(database, table);
         partitionTracker.onWrite(partition);
+        LOG.debug("[MultiTxn] write: partition={}, db={}, table={}, rows={}, uniqueKey={}",
+                partition, database, table, rows.length, uniqueKey);
         TableRegion region = getCacheRegion(uniqueKey, database, table, partition);
         for (String row : rows) {
             checkAndThrowException();

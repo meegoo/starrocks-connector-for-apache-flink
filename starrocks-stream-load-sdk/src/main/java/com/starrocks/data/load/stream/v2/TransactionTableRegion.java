@@ -267,8 +267,10 @@ public class TransactionTableRegion implements TableRegion {
                 } finally {
                     writeLock.set(false);
                 }
-                LOG.debug("[MultiTxn] switchChunkForCommit: db={}, table={}, inactiveChunks={}",
-                        database, table, inactiveChunks.size());
+                LOG.info("[MultiTxn] switchChunkForCommit: db={}, table={}, label={}, " +
+                        "inactiveChunks={}, cacheBytes={}, cacheRows={}, state={}",
+                        database, table, label, inactiveChunks.size(),
+                        cacheBytes.get(), cacheRows.get(), state.get());
                 return;
             }
             if (spins < MAX_SPIN_ATTEMPTS) {
@@ -331,8 +333,9 @@ public class TransactionTableRegion implements TableRegion {
     }
 
     public boolean flush(FlushReason reason) {
-        LOG.debug("Try to flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
-                database, table, label, cacheBytes, cacheRows, reason);
+        LOG.info("[MultiTxn] Try to flush db: {}, table: {}, label: {}, cacheBytes: {}, " +
+                "cacheRows: {}, state: {}, reason: {}",
+                database, table, label, cacheBytes, cacheRows, state.get(), reason);
         if (state.compareAndSet(State.ACTIVE, State.FLUSHING)) {
             int spins = 0;
             for (;;) {
@@ -475,6 +478,10 @@ public class TransactionTableRegion implements TableRegion {
         cacheRows.addAndGet(-chunk.numRows());
         response.setFlushBytes(chunk.rowBytes());
         response.setFlushRows(chunk.numRows());
+        LOG.info("[MultiTxn] complete: db={}, table={}, label={}, flushedRows={}, flushedBytes={}, " +
+                "remainingInactiveChunks={}, cacheBytes={}, cacheRows={}",
+                database, table, label, chunk.numRows(), chunk.rowBytes(),
+                inactiveChunks.size(), cacheBytes.get(), cacheRows.get());
         manager.callback(response);
         synchronized (this) {
             numRetries = 0;
@@ -482,13 +489,15 @@ public class TransactionTableRegion implements TableRegion {
         }
 
         if (!inactiveChunks.isEmpty()) {
-            LOG.debug("Stream load continue, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
-                    database, table, label, cacheBytes, cacheRows);
+            LOG.info("[MultiTxn] Stream load continue, db: {}, table: {}, label: {}, " +
+                    "remainingChunks: {}, cacheBytes: {}, cacheRows: {}",
+                    database, table, label, inactiveChunks.size(), cacheBytes, cacheRows);
             streamLoad(0);
             return;
         }
         if (state.compareAndSet(State.FLUSHING, State.ACTIVE)) {
-            LOG.debug("Stream load completed, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
+            LOG.info("[MultiTxn] Stream load completed (FLUSHING->ACTIVE), db: {}, table: {}, " +
+                    "label: {}, cacheBytes: {}, cacheRows: {}",
                     database, table, label, cacheBytes, cacheRows);
         }
     }

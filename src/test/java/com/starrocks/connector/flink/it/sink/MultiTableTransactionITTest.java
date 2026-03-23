@@ -152,8 +152,10 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      */
     @Test
     public void testEndToEndMultiPartition() throws Exception {
+        LOG.info("=== testEndToEndMultiPartition: START ===");
         String ordersTable = createOrdersTable();
         String orderItemsTable = createOrderItemsTable();
+        LOG.info("Created tables: orders={}, orderItems={}", ordersTable, orderItemsTable);
 
         StreamExecutionEnvironment env = buildEnv(2);
 
@@ -183,7 +185,9 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                 .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
                 .setParallelism(2);
 
+        LOG.info("testEndToEndMultiPartition: executing Flink job...");
         env.execute("testEndToEndMultiPartition");
+        LOG.info("testEndToEndMultiPartition: Flink job finished, verifying results...");
 
         verifyResult(
                 Arrays.asList(
@@ -221,8 +225,10 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      */
     @Test
     public void testNoFlushBeforeTxnEnd() throws Exception {
+        LOG.info("=== testNoFlushBeforeTxnEnd: START ===");
         String ordersTable = createOrdersTable();
         String orderItemsTable = createOrderItemsTable();
+        LOG.info("Created tables: orders={}, orderItems={}", ordersTable, orderItemsTable);
 
         TxnEndControlledSource.reset(DB_NAME, ordersTable, orderItemsTable);
 
@@ -245,18 +251,23 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         try {
             // Wait 2× flush interval — the age-based timer fires but commitAllowed=false
+            LOG.info("testNoFlushBeforeTxnEnd: waiting {}ms (2x flush interval)...", 2L * FLUSH_INTERVAL_MS);
             Thread.sleep(2L * FLUSH_INTERVAL_MS);
 
-            assertEquals("orders must be empty before txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
-            assertEquals("order_items must be empty before txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+            int ordersCount = scanTable(DB_CONNECTION, DB_NAME, ordersTable).size();
+            int itemsCount = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size();
+            LOG.info("testNoFlushBeforeTxnEnd: before txnEnd - orders={}, items={}", ordersCount, itemsCount);
+            assertEquals("orders must be empty before txnEnd", 0, ordersCount);
+            assertEquals("order_items must be empty before txnEnd", 0, itemsCount);
 
             LOG.info("Confirmed: no data visible before txnEnd. Sending txnEnd signal.");
             TxnEndControlledSource.SEND_TXN_END_LATCH.countDown();
 
+            LOG.info("testNoFlushBeforeTxnEnd: waiting for txnEnd to be emitted...");
             assertTrue("txnEnd row should be emitted within 10 s",
                     TxnEndControlledSource.TXN_END_EMITTED_LATCH.await(10, TimeUnit.SECONDS));
+            LOG.info("testNoFlushBeforeTxnEnd: txnEnd emitted, waiting {}ms for commit propagation...",
+                    COMMIT_PROPAGATION_MS);
 
             // Event-driven commit: switchChunk already done on task thread;
             // manager thread only needs one HTTP round-trip to flush + prepare + commit.
@@ -264,6 +275,8 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
             List<List<Object>> ordersAfter = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
             List<List<Object>> itemsAfter  = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable);
+            LOG.info("testNoFlushBeforeTxnEnd: after txnEnd - orders={}, items={}",
+                    ordersAfter.size(), itemsAfter.size());
 
             assertEquals("orders must have 1 row after txnEnd", 1, ordersAfter.size());
             assertEquals("order_items must have 2 rows after txnEnd", 2, itemsAfter.size());
@@ -277,10 +290,12 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                             Arrays.asList(2L, 1L, "gadget", 1, new BigDecimal("50.00"))),
                     itemsAfter);
 
-            LOG.info("Confirmed: data visible after txnEnd. Transaction consistency verified.");
+            LOG.info("=== testNoFlushBeforeTxnEnd: PASSED ===");
         } finally {
+            LOG.info("testNoFlushBeforeTxnEnd: interrupting job thread...");
             jobThread.interrupt();
             jobThread.join(5_000);
+            LOG.info("testNoFlushBeforeTxnEnd: job thread joined");
         }
     }
 
@@ -306,8 +321,10 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      */
     @Test
     public void testMultipleConsecutiveTransactions() throws Exception {
+        LOG.info("=== testMultipleConsecutiveTransactions: START ===");
         String ordersTable = createOrdersTable();
         String orderItemsTable = createOrderItemsTable();
+        LOG.info("Created tables: orders={}, orderItems={}", ordersTable, orderItemsTable);
 
         MultiTxnControlledSource.reset(DB_NAME, ordersTable, orderItemsTable);
 
@@ -330,31 +347,40 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         try {
             // ---- Phase 1: txn-1 data emitted, no txnEnd yet ----
+            LOG.info("testMultipleConsecutiveTransactions: Phase 1 - waiting {}ms...", 2L * FLUSH_INTERVAL_MS);
             Thread.sleep(2L * FLUSH_INTERVAL_MS);
-            assertEquals("orders empty before txn-1 txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
+            int count = scanTable(DB_CONNECTION, DB_NAME, ordersTable).size();
+            LOG.info("testMultipleConsecutiveTransactions: Phase 1 - orders count={}", count);
+            assertEquals("orders empty before txn-1 txnEnd", 0, count);
 
             // Allow txn-1 to commit
+            LOG.info("testMultipleConsecutiveTransactions: sending txn-1 end signal...");
             MultiTxnControlledSource.TXN1_END_LATCH.countDown();
             assertTrue("txn-1 end emitted within 10 s",
                     MultiTxnControlledSource.TXN1_END_EMITTED_LATCH.await(10, TimeUnit.SECONDS));
+            LOG.info("testMultipleConsecutiveTransactions: txn-1 end emitted, waiting {}ms...",
+                    COMMIT_PROPAGATION_MS);
             Thread.sleep(COMMIT_PROPAGATION_MS);
 
             // txn-1 data must now be visible
             List<List<Object>> afterTxn1 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            LOG.info("testMultipleConsecutiveTransactions: after txn-1 - orders count={}", afterTxn1.size());
             assertEquals("orders must have 1 row after txn-1", 1, afterTxn1.size());
             verifyResult(
                     Arrays.asList(Arrays.asList(1L, 100L, new BigDecimal("10.00"), "created")),
                     afterTxn1);
 
             // ---- Phase 2: txn-2 data emitted, no txnEnd yet ----
+            LOG.info("testMultipleConsecutiveTransactions: Phase 2 - waiting {}ms...", 2L * FLUSH_INTERVAL_MS);
             // commitInFlight was reset to false after txn-1 commit
             Thread.sleep(2L * FLUSH_INTERVAL_MS);
             List<List<Object>> midTxn2 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            LOG.info("testMultipleConsecutiveTransactions: Phase 2 - orders count={}", midTxn2.size());
             assertEquals("orders must still have only 1 row (txn-2 not committed yet)",
                     1, midTxn2.size());
 
             // Allow txn-2 to commit
+            LOG.info("testMultipleConsecutiveTransactions: sending txn-2 end signal...");
             MultiTxnControlledSource.TXN2_END_LATCH.countDown();
             assertTrue("txn-2 end emitted within 10 s",
                     MultiTxnControlledSource.TXN2_END_EMITTED_LATCH.await(10, TimeUnit.SECONDS));
@@ -362,6 +388,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
             // Both txn-1 and txn-2 data must be visible
             List<List<Object>> afterTxn2 = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
+            LOG.info("testMultipleConsecutiveTransactions: after txn-2 - orders count={}", afterTxn2.size());
             assertEquals("orders must have 2 rows after txn-2", 2, afterTxn2.size());
             verifyResult(
                     Arrays.asList(
@@ -369,10 +396,12 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                             Arrays.asList(2L, 101L, new BigDecimal("20.00"), "created")),
                     afterTxn2);
 
-            LOG.info("Confirmed: consecutive transaction isolation verified.");
+            LOG.info("=== testMultipleConsecutiveTransactions: PASSED ===");
         } finally {
+            LOG.info("testMultipleConsecutiveTransactions: interrupting job thread...");
             jobThread.interrupt();
             jobThread.join(5_000);
+            LOG.info("testMultipleConsecutiveTransactions: job thread joined");
         }
     }
 
@@ -382,6 +411,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      */
     @Test
     public void testEmptyTransaction() throws Exception {
+        LOG.info("=== testEmptyTransaction: START ===");
         String ordersTable = createOrdersTable();
         String orderItemsTable = createOrderItemsTable();
 
@@ -393,12 +423,15 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                 .keyBy(DefaultStarRocksRowData::getSourcePartition)
                 .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS));
 
+        LOG.info("testEmptyTransaction: executing Flink job...");
         env.execute("testEmptyTransaction");
+        LOG.info("testEmptyTransaction: Flink job finished, verifying...");
 
         assertEquals("orders must be empty after empty transaction",
                 0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
         assertEquals("order_items must be empty after empty transaction",
                 0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+        LOG.info("=== testEmptyTransaction: PASSED ===");
     }
 
     /**
@@ -421,10 +454,12 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      */
     @Test
     public void testAtomicVisibilityAcrossTables() throws Exception {
+        LOG.info("=== testAtomicVisibilityAcrossTables: START ===");
         String ordersTable = createOrdersTable();
         String orderItemsTable = createOrderItemsTable();
 
         String labelPrefix = "test-atomic-" + genRandomUuid().substring(0, 8) + "-";
+        LOG.info("Created tables: orders={}, orderItems={}, labelPrefix={}", ordersTable, orderItemsTable, labelPrefix);
 
         AtomicVisibilitySource.reset(DB_NAME, ordersTable, orderItemsTable);
 
@@ -448,23 +483,29 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         try {
             // Wait for data to be buffered but not committed
+            LOG.info("testAtomicVisibility: waiting {}ms...", 2L * FLUSH_INTERVAL_MS);
             Thread.sleep(2L * FLUSH_INTERVAL_MS);
 
-            assertEquals("orders must be empty before txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
-            assertEquals("order_items must be empty before txnEnd",
-                    0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+            int oc = scanTable(DB_CONNECTION, DB_NAME, ordersTable).size();
+            int ic = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size();
+            LOG.info("testAtomicVisibility: before txnEnd - orders={}, items={}", oc, ic);
+            assertEquals("orders must be empty before txnEnd", 0, oc);
+            assertEquals("order_items must be empty before txnEnd", 0, ic);
 
             // Signal txnEnd
+            LOG.info("testAtomicVisibility: sending txnEnd signal...");
             AtomicVisibilitySource.SEND_TXN_END_LATCH.countDown();
             assertTrue("txnEnd row should be emitted within 10 s",
                     AtomicVisibilitySource.TXN_END_EMITTED_LATCH.await(10, TimeUnit.SECONDS));
+            LOG.info("testAtomicVisibility: txnEnd emitted, waiting {}ms...", COMMIT_PROPAGATION_MS);
 
             Thread.sleep(COMMIT_PROPAGATION_MS);
 
             // Both tables must be non-empty at the same query point
             List<List<Object>> ordersAfter = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
             List<List<Object>> itemsAfter = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable);
+            LOG.info("testAtomicVisibility: after txnEnd - orders={}, items={}",
+                    ordersAfter.size(), itemsAfter.size());
 
             assertEquals("orders must have 1 row after txnEnd", 1, ordersAfter.size());
             assertEquals("order_items must have 2 rows after txnEnd", 2, itemsAfter.size());
@@ -484,10 +525,12 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             assertEquals("Exactly 1 committed transaction expected (shared label for both tables)",
                     1, committedCount);
 
-            LOG.info("Confirmed: cross-table atomic visibility with single shared transaction.");
+            LOG.info("=== testAtomicVisibilityAcrossTables: PASSED ===");
         } finally {
+            LOG.info("testAtomicVisibility: interrupting job thread...");
             jobThread.interrupt();
             jobThread.join(5_000);
+            LOG.info("testAtomicVisibility: job thread joined");
         }
     }
 
@@ -508,8 +551,10 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
      */
     @Test
     public void testPartialPartitionTxnEndBlocking() throws Exception {
+        LOG.info("=== testPartialPartitionTxnEndBlocking: START ===");
         String ordersTable = createOrdersTable();
         String orderItemsTable = createOrderItemsTable();
+        LOG.info("Created tables: orders={}, orderItems={}", ordersTable, orderItemsTable);
 
         PartialPartitionSource.reset(DB_NAME, ordersTable, orderItemsTable);
 
@@ -532,30 +577,36 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         try {
             // Wait for P0 data + txnEnd and P1 data (no txnEnd) to be processed
+            LOG.info("testPartialPartition: waiting for Phase 1 completion...");
             assertTrue("Phase 1 should complete within 10 s",
                     PartialPartitionSource.PHASE1_DONE_LATCH.await(10, TimeUnit.SECONDS));
+            LOG.info("testPartialPartition: Phase 1 done, waiting {}ms...", 3L * FLUSH_INTERVAL_MS);
 
             // Wait extra flush intervals to ensure the timer fires multiple times
             Thread.sleep(3L * FLUSH_INTERVAL_MS);
 
             // P1 has NOT sent txnEnd → allSwitched() is false → no commit
-            assertEquals("orders must be empty (P1 blocks commit)",
-                    0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
-            assertEquals("order_items must be empty (P1 blocks commit)",
-                    0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+            int oc = scanTable(DB_CONNECTION, DB_NAME, ordersTable).size();
+            int ic = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size();
+            LOG.info("testPartialPartition: before P1 txnEnd - orders={}, items={}", oc, ic);
+            assertEquals("orders must be empty (P1 blocks commit)", 0, oc);
+            assertEquals("order_items must be empty (P1 blocks commit)", 0, ic);
 
-            LOG.info("Confirmed: partial partition txnEnd correctly blocks commit.");
+            LOG.info("Confirmed: partial partition txnEnd correctly blocks commit. Sending P1 txnEnd...");
 
             // Now let P1 send txnEnd
             PartialPartitionSource.P1_TXN_END_LATCH.countDown();
             assertTrue("P1 txnEnd should be emitted within 10 s",
                     PartialPartitionSource.P1_TXN_END_EMITTED_LATCH.await(10, TimeUnit.SECONDS));
+            LOG.info("testPartialPartition: P1 txnEnd emitted, waiting {}ms...", COMMIT_PROPAGATION_MS);
 
             Thread.sleep(COMMIT_PROPAGATION_MS);
 
             // Now both partitions have txnEnd → data should be committed
             List<List<Object>> ordersAfter = scanTable(DB_CONNECTION, DB_NAME, ordersTable);
             List<List<Object>> itemsAfter = scanTable(DB_CONNECTION, DB_NAME, orderItemsTable);
+            LOG.info("testPartialPartition: after all txnEnd - orders={}, items={}",
+                    ordersAfter.size(), itemsAfter.size());
 
             assertEquals("orders must have 1 row after both partitions txnEnd",
                     1, ordersAfter.size());
@@ -569,10 +620,12 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                     Arrays.asList(Arrays.asList(1L, 1L, "widget", 2, new BigDecimal("25.00"))),
                     itemsAfter);
 
-            LOG.info("Confirmed: data visible after all partitions sent txnEnd.");
+            LOG.info("=== testPartialPartitionTxnEndBlocking: PASSED ===");
         } finally {
+            LOG.info("testPartialPartition: interrupting job thread...");
             jobThread.interrupt();
             jobThread.join(5_000);
+            LOG.info("testPartialPartition: job thread joined");
         }
     }
 
@@ -675,6 +728,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         @Override
         public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            LOG.info("[TxnEndControlledSource] Phase 1: emitting data rows (no txnEnd)...");
             // Phase 1: data rows, no txnEnd
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":1,\"customer_id\":100,\"total_amount\":99.99,\"order_status\":\"created\"}",
@@ -685,12 +739,15 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             ctx.collect(row(DB, ORDER_ITEMS_TABLE,
                     "{\"item_id\":2,\"order_id\":1,\"product_name\":\"gadget\",\"quantity\":1,\"price\":50.00}",
                     0, false));
+            LOG.info("[TxnEndControlledSource] Phase 1 done, waiting for SEND_TXN_END_LATCH...");
 
             SEND_TXN_END_LATCH.await();
 
             // Phase 2: txnEnd marker (null row = no data, just signal end-of-transaction)
+            LOG.info("[TxnEndControlledSource] Phase 2: emitting txnEnd marker...");
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));
             TXN_END_EMITTED_LATCH.countDown();
+            LOG.info("[TxnEndControlledSource] txnEnd emitted, source waiting for cancel...");
         }
 
         @Override
@@ -729,23 +786,30 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         @Override
         public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            LOG.info("[MultiTxnControlledSource] Emitting txn-1 data...");
             // txn-1 data
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":1,\"customer_id\":100,\"total_amount\":10.00,\"order_status\":\"created\"}",
                     0, false));
 
+            LOG.info("[MultiTxnControlledSource] Waiting for TXN1_END_LATCH...");
             TXN1_END_LATCH.await();
+            LOG.info("[MultiTxnControlledSource] Emitting txn-1 end...");
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));  // txn-1 end
             TXN1_END_EMITTED_LATCH.countDown();
 
             // txn-2 data (commitInFlight re-armed to false after txn-1 commit)
+            LOG.info("[MultiTxnControlledSource] Emitting txn-2 data...");
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":2,\"customer_id\":101,\"total_amount\":20.00,\"order_status\":\"created\"}",
                     0, false));
 
+            LOG.info("[MultiTxnControlledSource] Waiting for TXN2_END_LATCH...");
             TXN2_END_LATCH.await();
+            LOG.info("[MultiTxnControlledSource] Emitting txn-2 end...");
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));  // txn-2 end
             TXN2_END_EMITTED_LATCH.countDown();
+            LOG.info("[MultiTxnControlledSource] All transactions emitted, source waiting for cancel...");
         }
 
         @Override
@@ -784,6 +848,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         @Override
         public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            LOG.info("[AtomicVisibilitySource] Emitting data to both tables...");
             // Emit data to both tables in partition 0
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":1,\"customer_id\":100,\"total_amount\":88.88,\"order_status\":\"pending\"}",
@@ -794,10 +859,13 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
             ctx.collect(row(DB, ORDER_ITEMS_TABLE,
                     "{\"item_id\":2,\"order_id\":1,\"product_name\":\"beta\",\"quantity\":2,\"price\":22.22}",
                     0, false));
+            LOG.info("[AtomicVisibilitySource] Data emitted, waiting for SEND_TXN_END_LATCH...");
 
             SEND_TXN_END_LATCH.await();
+            LOG.info("[AtomicVisibilitySource] Emitting txnEnd...");
             ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));
             TXN_END_EMITTED_LATCH.countDown();
+            LOG.info("[AtomicVisibilitySource] txnEnd emitted, source waiting for cancel...");
         }
 
         @Override
@@ -836,6 +904,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         @Override
         public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            LOG.info("[PartialPartitionSource] Phase 1: P0 data + txnEnd, P1 data only...");
             // P0: write to orders + txnEnd
             ctx.collect(row(DB, ORDERS_TABLE,
                     "{\"order_id\":1,\"customer_id\":100,\"total_amount\":50.00,\"order_status\":\"created\"}",
@@ -848,12 +917,16 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                     1, false));
 
             // Signal test thread that phase 1 is done
+            LOG.info("[PartialPartitionSource] Phase 1 done, signaling test thread...");
             PHASE1_DONE_LATCH.countDown();
 
             // Wait for test thread to verify blocking, then send P1 txnEnd
+            LOG.info("[PartialPartitionSource] Waiting for P1_TXN_END_LATCH...");
             P1_TXN_END_LATCH.await();
+            LOG.info("[PartialPartitionSource] Emitting P1 txnEnd...");
             ctx.collect(row(DB, ORDER_ITEMS_TABLE, null, 1, true));  // P1 txnEnd
             P1_TXN_END_EMITTED_LATCH.countDown();
+            LOG.info("[PartialPartitionSource] All partitions done, source waiting for cancel...");
         }
 
         @Override

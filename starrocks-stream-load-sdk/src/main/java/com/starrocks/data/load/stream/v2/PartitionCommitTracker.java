@@ -90,12 +90,15 @@ public class PartitionCommitTracker {
             // Partition was never registered or was evicted after being idle.
             // Re-register it as TXN_END_RECEIVED so it participates correctly in the
             // next commit cycle; the empty-chunk case is handled gracefully downstream.
-            LOG.info("[MultiTxn] txnEnd for unknown/evicted partition {}, re-registering", partition);
+            LOG.info("[MultiTxn] txnEnd for unknown/evicted partition {}, re-registering. " +
+                    "Current partitions: {}", partition, partitions);
             partitions.put(partition, PartitionState.TXN_END_RECEIVED);
             return isIntervalElapsed();
         }
         if (state == PartitionState.ACTIVE) {
             partitions.put(partition, PartitionState.TXN_END_RECEIVED);
+            LOG.info("[MultiTxn] partition {} transitioned ACTIVE -> TXN_END_RECEIVED. " +
+                    "Partitions: {}", partition, partitions);
         } else if (state == PartitionState.SWITCHED) {
             // Partition is currently in an in-flight commit cycle. Record the txnEnd
             // so reset() can promote it to TXN_END_RECEIVED for the next cycle,
@@ -128,6 +131,9 @@ public class PartitionCommitTracker {
                 ready.add(entry.getKey());
             }
         }
+        if (!ready.isEmpty()) {
+            LOG.info("[MultiTxn] getReadyToSwitch: ready={}, allPartitions={}", ready, partitions);
+        }
         return ready;
     }
 
@@ -136,11 +142,14 @@ public class PartitionCommitTracker {
         if (partitions.isEmpty()) {
             return false;
         }
-        for (PartitionState state : partitions.values()) {
-            if (state != PartitionState.SWITCHED) {
+        for (Map.Entry<Integer, PartitionState> entry : partitions.entrySet()) {
+            if (entry.getValue() != PartitionState.SWITCHED) {
+                LOG.debug("[MultiTxn] allSwitched=false: partition {} is {}, all partitions: {}",
+                        entry.getKey(), entry.getValue(), partitions);
                 return false;
             }
         }
+        LOG.debug("[MultiTxn] allSwitched=true, partitions: {}", partitions);
         return true;
     }
 
