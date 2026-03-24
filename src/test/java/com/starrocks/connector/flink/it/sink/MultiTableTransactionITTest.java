@@ -20,11 +20,16 @@ package com.starrocks.connector.flink.it.sink;
 
 import com.starrocks.connector.flink.it.StarRocksITTestBase;
 import com.starrocks.connector.flink.table.data.DefaultStarRocksRowData;
+import com.starrocks.connector.flink.table.data.StarRocksRowData;
 import com.starrocks.connector.flink.table.sink.SinkFunctionFactory;
 import com.starrocks.connector.flink.table.sink.StarRocksSinkOptions;
+import com.starrocks.connector.flink.table.sink.v2.RecordSerializationSchema;
+import com.starrocks.connector.flink.table.sink.v2.StarRocksSink;
+import com.starrocks.connector.flink.table.sink.v2.StarRocksSinkContext;
 import com.starrocks.data.load.stream.properties.StreamLoadTableProperties;
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.api.common.serialization.SerializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -799,6 +804,111 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
     }
 
     // -------------------------------------------------------------------------
+    // Item 13: SinkV2 API (new unified Flink Sink API) multi-table test
+    // -------------------------------------------------------------------------
+
+    /**
+     * End-to-end test using the new Flink Sink V2 API ({@link StarRocksSink} +
+     * {@link com.starrocks.connector.flink.table.sink.v2.StarRocksWriter} +
+     * {@link com.starrocks.connector.flink.table.sink.v2.StarRocksCommitter})
+     * instead of the legacy {@code SinkFunction} API.
+     *
+     * <p>This verifies that multi-table transactions work correctly through the
+     * two-phase commit path: {@code StarRocksWriter.write()} routes data by
+     * partition → {@code flush(endOfInput=true)} triggers savepoint → data committed.
+     *
+     * <p>Uses {@code sinkTo()} instead of {@code addSink()}.
+     */
+    @Test
+    public void testEndToEndSinkV2Api() throws Exception {
+        String ordersTable = createOrdersTable();
+        String orderItemsTable = createOrderItemsTable();
+
+        StreamExecutionEnvironment env = buildEnv(1);
+
+        env.fromElements(
+                row(DB_NAME, ordersTable,
+                        "{\"order_id\":1,\"customer_id\":100,\"total_amount\":88.88,\"order_status\":\"created\"}",
+                        0, false),
+                row(DB_NAME, ordersTable,
+                        "{\"order_id\":2,\"customer_id\":101,\"total_amount\":55.55,\"order_status\":\"pending\"}",
+                        0, false),
+                row(DB_NAME, orderItemsTable,
+                        "{\"item_id\":1,\"order_id\":1,\"product_name\":\"alpha\",\"quantity\":2,\"price\":44.44}",
+                        0, false),
+                row(DB_NAME, orderItemsTable,
+                        "{\"item_id\":2,\"order_id\":2,\"product_name\":\"beta\",\"quantity\":1,\"price\":55.55}",
+                        0, true)
+        ).returns(TypeInformation.of(DefaultStarRocksRowData.class))
+                .keyBy(DefaultStarRocksRowData::getSourcePartition)
+                .sinkTo(buildSinkV2(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
+                .setParallelism(1);
+
+        runFlinkJobWithTimeout(env, "testEndToEndSinkV2Api");
+
+        verifyResult(
+                Arrays.asList(
+                        Arrays.asList(1L, 100L, new BigDecimal("88.88"), "created"),
+                        Arrays.asList(2L, 101L, new BigDecimal("55.55"), "pending")),
+                scanTable(DB_CONNECTION, DB_NAME, ordersTable));
+
+        verifyResult(
+                Arrays.asList(
+                        Arrays.asList(1L, 1L, "alpha", 2, new BigDecimal("44.44")),
+                        Arrays.asList(2L, 2L, "beta",  1, new BigDecimal("55.55"))),
+                scanTable(DB_CONNECTION, DB_NAME, orderItemsTable));
+    }
+
+    /**
+     * SinkV2 API test with 2 partitions, verifying that keyBy + sinkTo
+     * correctly routes data from different partitions.
+     */
+    @Test
+    public void testSinkV2ApiMultiPartition() throws Exception {
+        String ordersTable = createOrdersTable();
+        String orderItemsTable = createOrderItemsTable();
+
+        StreamExecutionEnvironment env = buildEnv(2);
+
+        DataStream<DefaultStarRocksRowData> partition0 = env.fromElements(
+                row(DB_NAME, ordersTable,
+                        "{\"order_id\":1,\"customer_id\":100,\"total_amount\":10.00,\"order_status\":\"created\"}",
+                        0, false),
+                row(DB_NAME, ordersTable,
+                        "{\"order_id\":2,\"customer_id\":101,\"total_amount\":20.00,\"order_status\":\"created\"}",
+                        0, true)
+        ).returns(TypeInformation.of(DefaultStarRocksRowData.class));
+
+        DataStream<DefaultStarRocksRowData> partition1 = env.fromElements(
+                row(DB_NAME, orderItemsTable,
+                        "{\"item_id\":1,\"order_id\":1,\"product_name\":\"widget\",\"quantity\":2,\"price\":5.00}",
+                        1, false),
+                row(DB_NAME, orderItemsTable,
+                        "{\"item_id\":2,\"order_id\":2,\"product_name\":\"gadget\",\"quantity\":3,\"price\":6.67}",
+                        1, true)
+        ).returns(TypeInformation.of(DefaultStarRocksRowData.class));
+
+        partition0.union(partition1)
+                .keyBy(DefaultStarRocksRowData::getSourcePartition)
+                .sinkTo(buildSinkV2(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
+                .setParallelism(2);
+
+        runFlinkJobWithTimeout(env, "testSinkV2ApiMultiPartition");
+
+        verifyResult(
+                Arrays.asList(
+                        Arrays.asList(1L, 100L, new BigDecimal("10.00"), "created"),
+                        Arrays.asList(2L, 101L, new BigDecimal("20.00"), "created")),
+                scanTable(DB_CONNECTION, DB_NAME, ordersTable));
+
+        verifyResult(
+                Arrays.asList(
+                        Arrays.asList(1L, 1L, "widget", 2, new BigDecimal("5.00")),
+                        Arrays.asList(2L, 2L, "gadget", 3, new BigDecimal("6.67"))),
+                scanTable(DB_CONNECTION, DB_NAME, orderItemsTable));
+    }
+
+    // -------------------------------------------------------------------------
     // Controlled source functions (use static fields to avoid ClosureCleaner)
     // -------------------------------------------------------------------------
 
@@ -1263,5 +1373,77 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         r.setSourcePartition(partition);
         r.setTransactionEnd(txnEnd);
         return r;
+    }
+
+    // -------------------------------------------------------------------------
+    // SinkV2 API helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Builds a {@link StarRocksSink} (new Flink Sink V2 API) for multi-table
+     * transaction mode, using a pass-through {@link RecordSerializationSchema}.
+     */
+    private StarRocksSink<DefaultStarRocksRowData> buildSinkV2(
+            String ordersTable, String orderItemsTable, int flushIntervalMs) {
+        StarRocksSinkOptions options = StarRocksSinkOptions.builder()
+                .withProperty("jdbc-url", getJdbcUrl())
+                .withProperty("load-url", getHttpUrls())
+                .withProperty("database-name", "*")
+                .withProperty("table-name", "*")
+                .withProperty("username", USERNAME)
+                .withProperty("password", PASSWORD)
+                .withProperty("sink.version", "V2")
+                .withProperty("sink.semantic", "at-least-once")
+                .withProperty("sink.transaction.multi-table.enabled", "true")
+                .withProperty("sink.buffer-flush.interval-ms", String.valueOf(flushIntervalMs))
+                .withProperty("sink.properties.format", "json")
+                .withProperty("sink.properties.strip_outer_array", "true")
+                .build();
+
+        options.addTableProperties(StreamLoadTableProperties.builder()
+                .database(DB_NAME)
+                .table(ordersTable)
+                .addProperty("format", "json")
+                .addProperty("strip_outer_array", "true")
+                .addProperty("ignore_json_size", "true")
+                .build());
+
+        options.addTableProperties(StreamLoadTableProperties.builder()
+                .database(DB_NAME)
+                .table(orderItemsTable)
+                .addProperty("format", "json")
+                .addProperty("strip_outer_array", "true")
+                .addProperty("ignore_json_size", "true")
+                .build());
+
+        return SinkFunctionFactory.createSink(options, new PassThroughSerializationSchema());
+    }
+
+    /**
+     * A pass-through {@link RecordSerializationSchema} that returns the input
+     * {@link DefaultStarRocksRowData} directly as the output {@link StarRocksRowData}.
+     * Used in SinkV2 API tests where the input already contains database, table,
+     * partition, and transaction boundary information.
+     */
+    private static class PassThroughSerializationSchema
+            implements RecordSerializationSchema<DefaultStarRocksRowData> {
+
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public void open(SerializationSchema.InitializationContext context,
+                         StarRocksSinkContext sinkContext) {
+            // no-op
+        }
+
+        @Override
+        public StarRocksRowData serialize(DefaultStarRocksRowData record) {
+            return record;
+        }
+
+        @Override
+        public void close() {
+            // no-op
+        }
     }
 }
