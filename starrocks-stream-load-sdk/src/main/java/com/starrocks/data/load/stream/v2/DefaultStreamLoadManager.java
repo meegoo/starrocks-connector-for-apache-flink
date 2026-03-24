@@ -510,6 +510,15 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
      * </ol>
      */
     private void processMultiTableCommit() {
+        // If a prior error occurred (e.g. failed HTTP load), abort the commit
+        // cycle immediately so the error surfaces via checkAndThrowException().
+        if (this.e != null) {
+            LOG.error("[MultiTxn] Aborting commit cycle due to prior error: {}", this.e.getMessage());
+            commitInFlight.set(false);
+            partitionTracker.reset();
+            return;
+        }
+
         final List<TransactionTableRegion> regionSnapshot =
                 Collections.unmodifiableList(new ArrayList<>(flushQ));
         try {
