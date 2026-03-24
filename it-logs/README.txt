@@ -7,3 +7,4 @@ Files:
 - multitable-it-20260324-161230.log — after pull 67fa6d6 (#16 StreamLoadSnapshot / transaction loader)
 - multitable-it-20260324-163250.log — after pull 260e2c1 (#17 SharedTransactionCoordinator)
 - multitable-it-20260324-184020.log — after pull e3973cd (#18; MultiTableTransactionITTest all passed)
+- multitable-it-20260324-193511.log — after pull fde6e09 (#19 checkpoint ITs; 9 tests, 1 failure: testTransactionSpansTwoCheckpointsFails)
