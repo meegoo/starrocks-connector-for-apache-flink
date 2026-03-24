@@ -34,12 +34,13 @@ public interface StreamLoader {
 
     /**
      * Begin a transaction with an explicit label. Used by multi-table transaction mode
-     * where multiple tables share one transaction label. StarRocks v4.0+ allows
-     * subsequent /api/transaction/load calls to target different tables under this label.
+     * where multiple tables share one transaction label. The transaction is opened at
+     * the database level without binding to a specific table, so subsequent
+     * /api/transaction/load calls can target different tables under this label.
      *
      * @return true if the transaction was successfully begun
      */
-    default boolean beginTransaction(String label, String database, String table) {
+    default boolean beginTransaction(String label, String database) {
         throw new UnsupportedOperationException(
                 "beginTransaction is not supported by this StreamLoader implementation");
     }
