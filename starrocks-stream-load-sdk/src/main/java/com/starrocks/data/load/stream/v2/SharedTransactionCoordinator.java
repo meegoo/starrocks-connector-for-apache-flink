@@ -133,7 +133,7 @@ public class SharedTransactionCoordinator {
      */
     public synchronized void prepareAndCommit(String anyTable) {
         StreamLoadSnapshot.Transaction txn =
-                new StreamLoadSnapshot.Transaction(database, anyTable, sharedLabel);
+                new StreamLoadSnapshot.Transaction(database, anyTable, sharedLabel, true);
 
         LOG.info("[MultiTxn] SharedTransaction prepare: label={}", sharedLabel);
         if (!streamLoader.prepare(txn)) {
@@ -180,7 +180,7 @@ public class SharedTransactionCoordinator {
             LOG.warn("[MultiTxn] SharedTransactionCoordinator reset, attempting rollback for label={}", sharedLabel);
             try {
                 StreamLoadSnapshot.Transaction txn =
-                        new StreamLoadSnapshot.Transaction(database, table, sharedLabel);
+                        new StreamLoadSnapshot.Transaction(database, table, sharedLabel, true);
                 streamLoader.rollback(txn);
                 LOG.info("[MultiTxn] Rollback succeeded for label={}", sharedLabel);
             } catch (Exception ex) {

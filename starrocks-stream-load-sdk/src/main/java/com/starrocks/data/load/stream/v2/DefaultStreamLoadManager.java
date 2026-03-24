@@ -1034,10 +1034,13 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     TransactionTableRegion newRegion = new TransactionTableRegion(
                             uniqueKey, database, table, this,
                             tableProperties, streamLoader, labelGenerator, maxRetries, retryIntervalInMs);
-                    // If a shared transaction is already open, inject its label so that
-                    // the first flush of this region uses the shared label.
-                    if (multiTableTransactionEnabled && txnCoordinator != null && txnCoordinator.isActive()) {
-                        newRegion.setLabel(txnCoordinator.getSharedLabel());
+                    if (multiTableTransactionEnabled) {
+                        newRegion.getHeaders().put("transaction_type", "multi");
+                        // If a shared transaction is already open, inject its label so that
+                        // the first flush of this region uses the shared label.
+                        if (txnCoordinator != null && txnCoordinator.isActive()) {
+                            newRegion.setLabel(txnCoordinator.getSharedLabel());
+                        }
                     }
                     regions.put(uniqueKey, newRegion);
                     flushQ.offer(newRegion);
