@@ -147,6 +147,8 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         httpPost.addHeader("db", database);
         if (table != null) {
             httpPost.addHeader("table", table);
+        } else {
+            httpPost.addHeader("transaction_type", "multi");
         }
 
         httpPost.setConfig(RequestConfig.custom()
