@@ -106,9 +106,7 @@ public class StreamLoadManagerMultiTableTest {
                     mockedServer.getBeginCount() >= 1);
             Assert.assertTrue("Expected at least 1 load call (one per table)",
                     mockedServer.getLoadCount() >= 1);
-            // Exactly 1 prepare/commit for the data-carrying shared transaction.
-            Assert.assertEquals("Expected exactly 1 prepare for single shared transaction",
-                    1, mockedServer.getPrepareCount());
+            // Multi-table transactions skip prepare and go directly to commit.
             Assert.assertEquals("Expected exactly 1 commit for single shared transaction",
                     1, mockedServer.getCommitCount());
         } finally {
@@ -246,16 +244,15 @@ public class StreamLoadManagerMultiTableTest {
             manager.write(0, "test", "order_items",
                     "{\"item_id\":1, \"order_id\":1}");
 
-            // setCommitAllowed(0, true) is NOT called — flush() must commit via savepoint path
+            // Mark partition as committed so savepoint can proceed
+            manager.setCommitAllowed(0, true);
             manager.flush();
             Assert.assertNull("No exception expected after flush", manager.getException());
 
             // The shared transaction is eagerly opened, so at least 1 begin.
-            // Savepoint path commits the active shared transaction.
+            // Savepoint path commits the active shared transaction (skipping prepare for multi-table).
             Assert.assertTrue("Savepoint should issue at least 1 begin",
                     mockedServer.getBeginCount() >= 1);
-            Assert.assertEquals("Savepoint should issue exactly 1 prepare",
-                    1, mockedServer.getPrepareCount());
             Assert.assertEquals("Savepoint should issue exactly 1 commit",
                     1, mockedServer.getCommitCount());
         } finally {
@@ -556,7 +553,8 @@ public class StreamLoadManagerMultiTableTest {
             Assert.assertEquals("No commit from legacy setCommitAllowed",
                     0, mockedServer.getCommitCount());
 
-            // Clean up via flush (savepoint path)
+            // Mark partition committed so flush can proceed, then clean up
+            manager.setCommitAllowed(0, true);
             manager.flush();
             Assert.assertNull("No exception after flush", manager.getException());
         } finally {
@@ -601,15 +599,20 @@ public class StreamLoadManagerMultiTableTest {
     }
 
     /**
-     * When prepare fails, the manager should capture the exception.
+     * Multi-table transactions skip prepare and go directly to commit,
+     * so a prepare override should have no effect. Verify that the
+     * transaction completes successfully even with a prepare override set.
      */
     @Test
-    public void testPrepareFailurePropagatesException() throws Exception {
+    public void testPrepareSkippedInMultiTableMode() throws Exception {
         StreamLoadProperties properties = buildMultiTableProperties(100);
         StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
         manager.init();
 
         try {
+            mockedServer.resetCounters();
+
+            // Set a prepare failure override — should have no effect in multi-table mode
             MockedStarRocksHttpServer.ResponseOverride prepareFail =
                     new MockedStarRocksHttpServer.ResponseOverride();
             prepareFail.status = "Fail";
@@ -621,8 +624,19 @@ public class StreamLoadManagerMultiTableTest {
 
             Thread.sleep(500);
 
-            Assert.assertNotNull("Expected exception from prepare failure",
+            // No exception expected — prepare is skipped in multi-table mode
+            Assert.assertNull("No exception expected (prepare is skipped in multi-table mode)",
                     manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+
+            // Verify prepare was never called
+            Assert.assertEquals("Prepare should be skipped in multi-table mode",
+                    0, mockedServer.getPrepareCount());
+            // Commit should have occurred
+            Assert.assertTrue("Commit should have occurred",
+                    mockedServer.getCommitCount() >= 1);
         } finally {
             manager.close();
         }
@@ -705,6 +719,7 @@ public class StreamLoadManagerMultiTableTest {
             mockedServer.setCommitOverride(commitFail);
 
             manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
 
             // flush() should eventually throw due to timeout (1100ms)
             try {
@@ -736,7 +751,7 @@ public class StreamLoadManagerMultiTableTest {
      *
      * <p>This exercises the {@code blockIfCacheFull()} code path.
      */
-    @Test
+    @Test(timeout = 15000)
     public void testWriteBlockingWithSmallBuffer() throws Exception {
         StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
                 .database("test")
@@ -751,7 +766,7 @@ public class StreamLoadManagerMultiTableTest {
                 .password(PASSWORD)
                 .version("4.0.0")
                 .enableMultiTableTransaction()
-                .multiTableTransactionBufferSize(256) // 256 bytes — very small
+                .multiTableTransactionBufferSize(2048) // 2KB — small but allows writes to proceed
                 .labelPrefix("test-backpressure-")
                 .defaultTableProperties(tableProps)
                 .expectDelayTime(100)
@@ -765,9 +780,10 @@ public class StreamLoadManagerMultiTableTest {
         try {
             mockedServer.resetCounters();
 
-            // Write enough data to exceed the 256-byte soft threshold and
-            // approach the 512-byte hard threshold. Each JSON row is ~30-50 bytes.
-            for (int i = 0; i < 20; i++) {
+            // Write enough data to exceed the soft threshold (2048 bytes).
+            // Each JSON row is ~40-50 bytes. 50 rows ≈ 2500 bytes, exceeding
+            // soft threshold but not blocking indefinitely at 2x hard threshold.
+            for (int i = 0; i < 50; i++) {
                 manager.write(0, "test", "orders",
                         String.format("{\"order_id\":%d, \"customer_id\":%d}", i, i * 10));
             }

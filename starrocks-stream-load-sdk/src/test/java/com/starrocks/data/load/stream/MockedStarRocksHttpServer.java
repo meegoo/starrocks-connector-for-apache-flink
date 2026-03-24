@@ -365,9 +365,14 @@ public class MockedStarRocksHttpServer {
             String label = h.getFirst("label");
             String db = h.getFirst("db");
             String table = h.getFirst("table");
-            if (label == null || db == null || table == null) {
+            String txnType = h.getFirst("transaction_type");
+            boolean isMultiTable = "multi".equals(txnType);
+            if (label == null || db == null || (table == null && !isMultiTable)) {
                 sendJson(exchange, 400, toJson(mapOf("Status", StreamLoadConstants.RESULT_STATUS_FAILED, "Message", "Missing label/db/table")));
                 return;
+            }
+            if (table == null) {
+                table = "__multi_table__";
             }
 
             beginCount.incrementAndGet();
@@ -471,9 +476,14 @@ public class MockedStarRocksHttpServer {
             String label = h.getFirst("label");
             String db = h.getFirst("db");
             String table = h.getFirst("table");
-            if (label == null || db == null || table == null) {
+            String txnType = h.getFirst("transaction_type");
+            boolean isMultiTable = "multi".equals(txnType);
+            if (label == null || db == null || (table == null && !isMultiTable)) {
                 sendJson(exchange, 400, toJson(mapOf("Status", StreamLoadConstants.RESULT_STATUS_FAILED, "Message", "Missing label/db/table")));
                 return;
+            }
+            if (table == null) {
+                table = "__multi_table__";
             }
 
             prepareCount.incrementAndGet();
@@ -516,9 +526,14 @@ public class MockedStarRocksHttpServer {
             String label = h.getFirst("label");
             String db = h.getFirst("db");
             String table = h.getFirst("table");
-            if (label == null || db == null || table == null) {
+            String txnType = h.getFirst("transaction_type");
+            boolean isMultiTable = "multi".equals(txnType);
+            if (label == null || db == null || (table == null && !isMultiTable)) {
                 sendJson(exchange, 400, toJson(mapOf("Status", StreamLoadConstants.RESULT_STATUS_FAILED, "Message", "Missing label/db/table")));
                 return;
+            }
+            if (table == null) {
+                table = "__multi_table__";
             }
 
             commitCount.incrementAndGet();
@@ -559,9 +574,14 @@ public class MockedStarRocksHttpServer {
             String label = h.getFirst("label");
             String db = h.getFirst("db");
             String table = h.getFirst("table");
-            if (label == null || db == null || table == null) {
+            String txnType = h.getFirst("transaction_type");
+            boolean isMultiTable = "multi".equals(txnType);
+            if (label == null || db == null || (table == null && !isMultiTable)) {
                 sendJson(exchange, 400, toJson(mapOf("Status", StreamLoadConstants.RESULT_STATUS_FAILED, "Message", "Missing label/db/table")));
                 return;
+            }
+            if (table == null) {
+                table = "__multi_table__";
             }
 
             ResponseOverride override = rollbackOverride;
