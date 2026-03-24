@@ -192,6 +192,23 @@ public class PartitionCommitTracker {
         LOG.info("[MultiTxn] PartitionCommitTracker reset, partitions: {}", partitions);
     }
 
+    /**
+     * Returns the list of partitions that are still in ACTIVE state (have not
+     * received a txnEnd marker). In multi-table transaction mode, upstream must
+     * ensure all transactions are complete before a checkpoint barrier arrives.
+     * If any partitions are ACTIVE at savepoint time, it indicates a violation
+     * of this contract.
+     */
+    public synchronized List<Integer> getActivePartitions() {
+        List<Integer> active = new ArrayList<>();
+        for (Map.Entry<Integer, PartitionState> entry : partitions.entrySet()) {
+            if (entry.getValue() == PartitionState.ACTIVE) {
+                active.add(entry.getKey());
+            }
+        }
+        return active;
+    }
+
     public synchronized boolean isEmpty() {
         return partitions.isEmpty();
     }
