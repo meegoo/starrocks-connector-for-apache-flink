@@ -465,19 +465,25 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             return;
         }
 
-        // Record the txnEnd in the tracker but do NOT call trySwitchAndCommit()
-        // here and do NOT signal the manager thread.  This method runs on the Flink
-        // task thread during record processing.  If we checked allSwitched() now —
-        // or if the manager thread woke up immediately from a signal — partitions
-        // whose data hasn't been processed yet (next records in the stream) would
-        // be missing from the tracker, causing a premature commit.
-        //
-        // Instead, we rely on the manager thread's periodic scan (every
-        // scanningFrequency ms, default 50 ms).  By the next scan cycle the task
-        // thread has processed all subsequent records and every partition is
-        // registered in the tracker.
-        partitionTracker.onTxnEnd(partition);
-        LOG.debug("[MultiTxn] txnEnd for partition={}", partition);
+        // Record the txnEnd and immediately switch chunks on the task thread.
+        // This must happen synchronously before returning, because the very next
+        // record from the source may belong to a new transaction.  If we deferred
+        // the switch to the manager thread, the new transaction's write() would
+        // call onWrite() and reset the partition back to ACTIVE, causing the
+        // previous transaction's commit to be lost.
+        boolean transitioned = partitionTracker.onTxnEnd(partition);
+        if (transitioned) {
+            List<TransactionTableRegion> pRegions = partitionRegions.get(partition);
+            if (pRegions != null) {
+                for (TransactionTableRegion region : pRegions) {
+                    region.switchChunkForCommit();
+                }
+            }
+            partitionTracker.markSwitched(partition);
+            LOG.debug("[MultiTxn] txnEnd for partition={}, regions immediately switched", partition);
+        } else {
+            LOG.debug("[MultiTxn] txnEnd for partition={}, deferred (already switched)", partition);
+        }
     }
 
     /**

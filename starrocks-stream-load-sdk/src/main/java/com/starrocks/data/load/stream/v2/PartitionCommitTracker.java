@@ -69,12 +69,20 @@ public class PartitionCommitTracker {
     }
 
     /**
-     * Called when data is written for a partition. Always (re-)sets the partition to
-     * ACTIVE. This is critical when a partition that was TXN_END_RECEIVED or SWITCHED
-     * receives data from a new source transaction — the state must be reset so the
-     * new data is not prematurely included in the current commit cycle.
+     * Called when data is written for a partition. Sets the partition to ACTIVE
+     * unless it is already SWITCHED (part of an in-flight commit cycle).
+     *
+     * <p>When a partition is SWITCHED, its previous transaction's data has been
+     * frozen via {@code switchChunkForCommit()} and a commit is pending. New
+     * writes go into the fresh active chunk created by the switch, so there is
+     * no risk of mixing transactions. Resetting to ACTIVE here would lose the
+     * SWITCHED state and prevent the pending commit from completing.
      */
     public synchronized void onWrite(int partition) {
+        PartitionState state = partitions.get(partition);
+        if (state == PartitionState.SWITCHED) {
+            return;
+        }
         partitions.put(partition, PartitionState.ACTIVE);
         pendingTxnEnd.remove(partition);
     }
@@ -82,7 +90,8 @@ public class PartitionCommitTracker {
     /**
      * Called when a txnEnd marker arrives for a partition.
      *
-     * @return {@code true} if the flush interval has elapsed (caller should attempt switch)
+     * @return {@code true} if the partition transitioned to TXN_END_RECEIVED and
+     *         should be switched immediately by the caller
      */
     public synchronized boolean onTxnEnd(int partition) {
         PartitionState state = partitions.get(partition);
@@ -92,10 +101,11 @@ public class PartitionCommitTracker {
             // next commit cycle; the empty-chunk case is handled gracefully downstream.
             LOG.info("[MultiTxn] txnEnd for unknown/evicted partition {}, re-registering", partition);
             partitions.put(partition, PartitionState.TXN_END_RECEIVED);
-            return isIntervalElapsed();
+            return true;
         }
         if (state == PartitionState.ACTIVE) {
             partitions.put(partition, PartitionState.TXN_END_RECEIVED);
+            return true;
         } else if (state == PartitionState.SWITCHED) {
             // Partition is currently in an in-flight commit cycle. Record the txnEnd
             // so reset() can promote it to TXN_END_RECEIVED for the next cycle,
@@ -105,7 +115,7 @@ public class PartitionCommitTracker {
         }
         // If already TXN_END_RECEIVED, a second txnEnd accumulates more data into the
         // same commit cycle (N:1 mapping) — no state change needed.
-        return isIntervalElapsed();
+        return false;
     }
 
     /** Marks a partition as switched (its regions have been frozen for commit). */
