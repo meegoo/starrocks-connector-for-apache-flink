@@ -430,6 +430,7 @@ limitations under the License.
                         <exclude>.github/**</exclude>
                         <exclude>SECURITY.md</exclude>
                         <exclude>.cursor/**</exclude>
+                        <exclude>it-logs/**</exclude>
                         <exclude>starrocks-stream-load-sdk/**</exclude>
                     </excludes>
                 </configuration>
