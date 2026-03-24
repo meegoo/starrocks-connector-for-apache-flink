@@ -33,6 +33,8 @@ import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
+
 import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.List;
@@ -73,6 +75,12 @@ import static org.junit.Assert.assertTrue;
  *       partitions has sent txnEnd, data must NOT be committed.</li>
  *   <li>{@link #testCheckpointTriggeredFlushDataIntegrity} — checkpoint: Flink checkpoint
  *       triggers flush(), all buffered data must be committed completely.</li>
+ *   <li>{@link #testTransactionWithinSingleCheckpoint} — checkpoint: when the entire
+ *       transaction (data + txnEnd) completes before the checkpoint barrier, the
+ *       checkpoint succeeds and data is committed correctly.</li>
+ *   <li>{@link #testTransactionSpansTwoCheckpointsFails} — checkpoint: when a transaction
+ *       is still open (no txnEnd) when the checkpoint barrier arrives, the job must
+ *       fail with an {@link IllegalStateException} indicating active partitions.</li>
  * </ol>
  */
 public class MultiTableTransactionITTest extends StarRocksITTestBase {
@@ -647,6 +655,148 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         LOG.info("Confirmed: flush committed all multi-table data via savepoint path.");
     }
 
+    /**
+     * Checkpoint test: transaction fits entirely within one checkpoint.
+     *
+     * <p>Verifies that when the source emits data rows followed by a txnEnd marker
+     * <em>before</em> the Flink checkpoint barrier arrives, the checkpoint succeeds
+     * and all data is committed correctly to StarRocks.
+     *
+     * <p>This exercises the happy path of the checkpoint + multi-table transaction
+     * interaction: by the time {@code flush()} is called during {@code snapshotState()},
+     * all partitions have already received txnEnd, so {@code getActivePartitions()}
+     * returns an empty list and the shared transaction commits successfully.
+     *
+     * <p>Timeline:
+     * <pre>
+     *   t=0              source emits data + txnEnd for both tables
+     *   t=Δ              txnEnd triggers event-driven commit → data committed
+     *   t=checkpoint     checkpoint barrier arrives → flush() finds no active partitions → OK
+     *   t=finish         job finishes → verify data in StarRocks
+     * </pre>
+     */
+    @Test
+    public void testTransactionWithinSingleCheckpoint() throws Exception {
+        String ordersTable = createOrdersTable();
+        String orderItemsTable = createOrderItemsTable();
+
+        CheckpointTxnWithinSource.reset(DB_NAME, ordersTable, orderItemsTable);
+
+        File checkpointDir = temporaryFolder.newFolder();
+        StreamExecutionEnvironment env = buildEnvWithCheckpointing(1, checkpointDir.toURI().toString());
+
+        env.addSource(new CheckpointTxnWithinSource())
+                .setParallelism(1)
+                .returns(TypeInformation.of(DefaultStarRocksRowData.class))
+                .keyBy(DefaultStarRocksRowData::getSourcePartition)
+                .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
+                .setParallelism(1);
+
+        runFlinkJobWithTimeout(env, "testTransactionWithinSingleCheckpoint");
+
+        // Verify all data committed successfully
+        verifyResult(
+                Arrays.asList(
+                        Arrays.asList(1L, 100L, new BigDecimal("10.00"), "created"),
+                        Arrays.asList(2L, 101L, new BigDecimal("20.00"), "created")),
+                scanTable(DB_CONNECTION, DB_NAME, ordersTable));
+
+        verifyResult(
+                Arrays.asList(
+                        Arrays.asList(1L, 1L, "widget", 2, new BigDecimal("10.00")),
+                        Arrays.asList(2L, 2L, "gadget", 1, new BigDecimal("20.00"))),
+                scanTable(DB_CONNECTION, DB_NAME, orderItemsTable));
+
+        LOG.info("Confirmed: transaction within single checkpoint committed successfully.");
+    }
+
+    /**
+     * Checkpoint test: transaction spans two checkpoints — must fail.
+     *
+     * <p>Verifies that when a source transaction is still open (no txnEnd marker
+     * received) when the Flink checkpoint barrier arrives, the job fails with an
+     * {@link IllegalStateException}. This enforces the contract that upstream must
+     * complete all transactions before the checkpoint barrier.
+     *
+     * <p>The source emits data rows without txnEnd, then waits long enough for a
+     * checkpoint to fire. The checkpoint's {@code snapshotState()} calls
+     * {@code flush()}, which detects active partitions and throws:
+     * <pre>
+     *   [MultiTxn] Partitions [...] still have uncommitted transaction data
+     *   at checkpoint.
+     * </pre>
+     *
+     * <p>Timeline:
+     * <pre>
+     *   t=0              source emits data rows (no txnEnd)
+     *   t=checkpoint     checkpoint barrier arrives → flush() finds active partitions → FAIL
+     * </pre>
+     */
+    @Test
+    public void testTransactionSpansTwoCheckpointsFails() throws Exception {
+        String ordersTable = createOrdersTable();
+        String orderItemsTable = createOrderItemsTable();
+
+        CheckpointTxnSpansSource.reset(DB_NAME, ordersTable, orderItemsTable);
+
+        File checkpointDir = temporaryFolder.newFolder();
+        // Short checkpoint interval so the barrier fires quickly
+        StreamExecutionEnvironment env = buildEnvWithCheckpointing(1, checkpointDir.toURI().toString());
+
+        env.addSource(new CheckpointTxnSpansSource())
+                .setParallelism(1)
+                .returns(TypeInformation.of(DefaultStarRocksRowData.class))
+                .keyBy(DefaultStarRocksRowData::getSourcePartition)
+                .addSink(buildSink(ordersTable, orderItemsTable, FLUSH_INTERVAL_MS))
+                .setParallelism(1);
+
+        AtomicReference<Throwable> executionError = new AtomicReference<>();
+        Thread jobThread = new Thread(() -> {
+            try {
+                env.execute("testTransactionSpansTwoCheckpointsFails");
+            } catch (Throwable t) {
+                executionError.set(t);
+            }
+        }, "flink-job-testTransactionSpansTwoCheckpointsFails");
+        jobThread.start();
+        jobThread.join(FLINK_EXECUTE_TIMEOUT_MS);
+
+        if (jobThread.isAlive()) {
+            jobThread.interrupt();
+            jobThread.join(5_000);
+        }
+
+        // The job must have failed
+        Throwable error = executionError.get();
+        assertTrue("Job should fail when transaction spans checkpoint, but completed successfully",
+                error != null);
+
+        // Unwrap to find the IllegalStateException about active partitions
+        Throwable cause = error;
+        boolean foundExpectedError = false;
+        while (cause != null) {
+            if (cause instanceof IllegalStateException
+                    && cause.getMessage() != null
+                    && cause.getMessage().contains("uncommitted transaction data at checkpoint")) {
+                foundExpectedError = true;
+                break;
+            }
+            cause = cause.getCause();
+        }
+
+        assertTrue("Expected IllegalStateException about uncommitted transaction data at checkpoint, "
+                        + "but got: " + error.getMessage(),
+                foundExpectedError);
+
+        // Tables should be empty — the transaction was never committed
+        assertEquals("orders must be empty after failed checkpoint",
+                0, scanTable(DB_CONNECTION, DB_NAME, ordersTable).size());
+        assertEquals("order_items must be empty after failed checkpoint",
+                0, scanTable(DB_CONNECTION, DB_NAME, orderItemsTable).size());
+
+        LOG.info("Confirmed: transaction spanning checkpoint correctly rejected with IllegalStateException.");
+    }
+
     // -------------------------------------------------------------------------
     // Controlled source functions (use static fields to avoid ClosureCleaner)
     // -------------------------------------------------------------------------
@@ -868,6 +1018,110 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         }
     }
 
+    /**
+     * Source for {@link #testTransactionWithinSingleCheckpoint}.
+     *
+     * <p>Emits data to both tables followed by a txnEnd marker, then stays alive
+     * long enough for at least one Flink checkpoint to succeed before finishing.
+     */
+    private static class CheckpointTxnWithinSource
+            extends RichParallelSourceFunction<DefaultStarRocksRowData> {
+
+        private static final long serialVersionUID = 1L;
+
+        static volatile String DB;
+        static volatile String ORDERS_TABLE;
+        static volatile String ORDER_ITEMS_TABLE;
+
+        static void reset(String db, String ordersTable, String orderItemsTable) {
+            DB = db;
+            ORDERS_TABLE = ordersTable;
+            ORDER_ITEMS_TABLE = orderItemsTable;
+        }
+
+        private volatile boolean running = true;
+
+        @Override
+        public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            // Emit data to both tables
+            ctx.collect(row(DB, ORDERS_TABLE,
+                    "{\"order_id\":1,\"customer_id\":100,\"total_amount\":10.00,\"order_status\":\"created\"}",
+                    0, false));
+            ctx.collect(row(DB, ORDERS_TABLE,
+                    "{\"order_id\":2,\"customer_id\":101,\"total_amount\":20.00,\"order_status\":\"created\"}",
+                    0, false));
+            ctx.collect(row(DB, ORDER_ITEMS_TABLE,
+                    "{\"item_id\":1,\"order_id\":1,\"product_name\":\"widget\",\"quantity\":2,\"price\":10.00}",
+                    0, false));
+            ctx.collect(row(DB, ORDER_ITEMS_TABLE,
+                    "{\"item_id\":2,\"order_id\":2,\"product_name\":\"gadget\",\"quantity\":1,\"price\":20.00}",
+                    0, false));
+
+            // txnEnd — transaction is complete before any checkpoint fires
+            ctx.collect(row(DB, ORDERS_TABLE, null, 0, true));
+
+            // Stay alive long enough for at least one checkpoint to complete,
+            // then finish so the job terminates.
+            long waited = 0;
+            while (running && waited < 5_000) {
+                Thread.sleep(100);
+                waited += 100;
+            }
+        }
+
+        @Override
+        public void cancel() {
+            running = false;
+        }
+    }
+
+    /**
+     * Source for {@link #testTransactionSpansTwoCheckpointsFails}.
+     *
+     * <p>Emits data rows without txnEnd, then blocks until cancelled.
+     * This guarantees that a Flink checkpoint will fire while the transaction
+     * is still open, which must trigger an {@link IllegalStateException}.
+     */
+    private static class CheckpointTxnSpansSource
+            extends RichParallelSourceFunction<DefaultStarRocksRowData> {
+
+        private static final long serialVersionUID = 1L;
+
+        static volatile String DB;
+        static volatile String ORDERS_TABLE;
+        static volatile String ORDER_ITEMS_TABLE;
+
+        static void reset(String db, String ordersTable, String orderItemsTable) {
+            DB = db;
+            ORDERS_TABLE = ordersTable;
+            ORDER_ITEMS_TABLE = orderItemsTable;
+        }
+
+        private volatile boolean running = true;
+
+        @Override
+        public void run(SourceContext<DefaultStarRocksRowData> ctx) throws Exception {
+            // Emit data to both tables — deliberately NO txnEnd
+            ctx.collect(row(DB, ORDERS_TABLE,
+                    "{\"order_id\":1,\"customer_id\":100,\"total_amount\":50.00,\"order_status\":\"created\"}",
+                    0, false));
+            ctx.collect(row(DB, ORDER_ITEMS_TABLE,
+                    "{\"item_id\":1,\"order_id\":1,\"product_name\":\"widget\",\"quantity\":3,\"price\":16.67}",
+                    0, false));
+
+            // Block until cancelled — the checkpoint barrier WILL arrive
+            // while the transaction is still open (no txnEnd sent)
+            while (running) {
+                Thread.sleep(100);
+            }
+        }
+
+        @Override
+        public void cancel() {
+            running = false;
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Shared builder helpers
     // -------------------------------------------------------------------------
@@ -881,6 +1135,15 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         // break if a Flink checkpoint triggered an early commit.  The
         // savepoint code path is still exercised through finish() / close()
         // which call sinkManager.flush().
+        return env;
+    }
+
+    private StreamExecutionEnvironment buildEnvWithCheckpointing(int parallelism, String checkpointDir) {
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setRuntimeMode(RuntimeExecutionMode.STREAMING);
+        env.setParallelism(parallelism);
+        env.enableCheckpointing(1000);
+        env.getCheckpointConfig().setCheckpointStorage(checkpointDir);
         return env;
     }
 
