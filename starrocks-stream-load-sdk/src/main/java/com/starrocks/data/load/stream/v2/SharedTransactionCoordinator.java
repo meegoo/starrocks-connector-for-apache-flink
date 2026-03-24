@@ -135,13 +135,10 @@ public class SharedTransactionCoordinator {
         StreamLoadSnapshot.Transaction txn =
                 new StreamLoadSnapshot.Transaction(database, anyTable, sharedLabel, true);
 
-        LOG.info("[MultiTxn] SharedTransaction prepare: label={}", sharedLabel);
-        if (!streamLoader.prepare(txn)) {
-            throw new StreamLoadFailException(
-                    "Failed to prepare shared transaction, label: " + sharedLabel);
-        }
-
-        LOG.info("[MultiTxn] SharedTransaction commit: label={}", sharedLabel);
+        // Skip prepare for multi-table transactions — StarRocks does not
+        // support TXN_PREPARE in multi-table transaction mode. Go directly
+        // to commit.
+        LOG.info("[MultiTxn] SharedTransaction commit (skip prepare): label={}", sharedLabel);
         if (!streamLoader.commit(txn)) {
             throw new StreamLoadFailException(
                     "Failed to commit shared transaction, label: " + sharedLabel);
