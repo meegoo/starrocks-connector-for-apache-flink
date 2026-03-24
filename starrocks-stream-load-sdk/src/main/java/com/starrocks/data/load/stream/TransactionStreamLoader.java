@@ -203,7 +203,11 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         httpPost.setHeaders(preparedTxnHeader);
         httpPost.addHeader("label", transaction.getLabel());
         httpPost.addHeader("db", transaction.getDatabase());
-        httpPost.addHeader("table", transaction.getTable());
+        if (transaction.isMultiTable()) {
+            httpPost.addHeader("transaction_type", "multi");
+        } else {
+            httpPost.addHeader("table", transaction.getTable());
+        }
 
         httpPost.setConfig(RequestConfig.custom()
                         .setSocketTimeout(properties.getSocketTimeout())
@@ -274,7 +278,11 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         httpPost.setHeaders(defaultTxnHeaders);
         httpPost.addHeader("label", transaction.getLabel());
         httpPost.addHeader("db", transaction.getDatabase());
-        httpPost.addHeader("table", transaction.getTable());
+        if (transaction.isMultiTable()) {
+            httpPost.addHeader("transaction_type", "multi");
+        } else {
+            httpPost.addHeader("table", transaction.getTable());
+        }
         if (properties.getPublishTimeoutMs() > 0) {
             int timeoutSeconds = Math.max(1, properties.getPublishTimeoutMs() / 1000);
             httpPost.addHeader("timeout", String.valueOf(timeoutSeconds));
@@ -353,7 +361,11 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         httpPost.setHeaders(defaultTxnHeaders);
         httpPost.addHeader("label", transaction.getLabel());
         httpPost.addHeader("db", transaction.getDatabase());
-        httpPost.addHeader("table", transaction.getTable());
+        if (transaction.isMultiTable()) {
+            httpPost.addHeader("transaction_type", "multi");
+        } else {
+            httpPost.addHeader("table", transaction.getTable());
+        }
 
         try (CloseableHttpClient client = clientBuilder.build()) {
             String responseBody;
