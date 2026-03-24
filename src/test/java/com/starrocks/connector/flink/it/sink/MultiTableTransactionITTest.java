@@ -584,19 +584,16 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
     }
 
     /**
-     * Checkpoint-triggered flush data integrity test.
+     * Flush data integrity test with a large flush interval.
      *
-     * <p>Verifies that when a Flink checkpoint triggers {@code flush()} (savepoint
-     * path), all buffered multi-table data is committed completely — even if no
-     * txnEnd has been received from any partition.
+     * <p>Verifies that when the timer-driven flush never fires (because the flush
+     * interval is very large), the {@code finish()} → {@code flush()} savepoint
+     * path still commits all buffered multi-table data correctly.
      *
-     * <p>This exercises the savepoint code path in {@code DefaultStreamLoadManager}
-     * where the manager thread detects an active shared transaction and forces
-     * switchChunk + load + prepare + commit for all regions.
-     *
-     * <p>The source emits data to two tables without sending txnEnd, then stops.
-     * The job finishes normally via {@code close()} → {@code flush()}, which acts
-     * as a savepoint. After the job completes, both tables must have all expected rows.
+     * <p>The source emits data to two tables with a txnEnd marker on the last row,
+     * then the bounded source finishes. The sink's {@code finish()} calls
+     * {@code flush()}, which acts as a savepoint and must commit everything.
+     * After the job completes, both tables must have all expected rows.
      */
     @Test
     public void testCheckpointTriggeredFlushDataIntegrity() throws Exception {
@@ -605,11 +602,11 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
 
         StreamExecutionEnvironment env = buildEnv(1);
         // Use a very large flush interval so the timer never fires —
-        // only the flush() from close() should commit the data.
+        // only the flush() from finish()/close() should commit the data.
         int largeFlushInterval = 60_000;
 
-        // Emit data to two tables WITHOUT txnEnd, then source finishes.
-        // The sink's close() will call flush(), which must commit everything.
+        // Emit data to two tables with txnEnd on the last row, then source finishes.
+        // The sink's finish() will call flush(), which must commit everything.
         env.fromElements(
                 row(DB_NAME, ordersTable,
                         "{\"order_id\":1,\"customer_id\":100,\"total_amount\":10.00,\"order_status\":\"created\"}",
@@ -622,13 +619,13 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                         0, false),
                 row(DB_NAME, orderItemsTable,
                         "{\"item_id\":2,\"order_id\":2,\"product_name\":\"gadget\",\"quantity\":1,\"price\":20.00}",
-                        0, false)
+                        0, true)
         ).returns(TypeInformation.of(DefaultStarRocksRowData.class))
                 .keyBy(DefaultStarRocksRowData::getSourcePartition)
                 .addSink(buildSink(ordersTable, orderItemsTable, largeFlushInterval))
                 .setParallelism(1);
 
-        // close() triggers flush(); bounded wait so a hang still yields a test failure + Results
+        // finish()/close() triggers flush(); bounded wait so a hang still yields a test failure + Results
         runFlinkJobWithTimeout(env, "testCheckpointTriggeredFlushDataIntegrity");
 
         // All data must be committed by the savepoint path
@@ -647,7 +644,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
                         Arrays.asList(2L, 2L, "gadget", 1, new BigDecimal("20.00"))),
                 itemsAfter);
 
-        LOG.info("Confirmed: checkpoint-triggered flush committed all multi-table data.");
+        LOG.info("Confirmed: flush committed all multi-table data via savepoint path.");
     }
 
     // -------------------------------------------------------------------------

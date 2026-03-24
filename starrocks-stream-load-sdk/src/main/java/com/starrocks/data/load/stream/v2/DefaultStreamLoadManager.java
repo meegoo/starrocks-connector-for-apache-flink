@@ -227,16 +227,17 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                           try {
                             LOG.info("[MultiTxn] Savepoint: completing shared transaction");
 
-                            // If some partitions are still ACTIVE (no txnEnd received),
-                            // commit whatever data is buffered. This can happen when a
-                            // Flink checkpoint fires mid-transaction or when the source
-                            // finishes without sending txnEnd markers.  For at-least-once
-                            // semantics this is correct: we flush and commit all buffered
-                            // data so it is not lost.
+                            // Upstream must ensure all source transactions are complete
+                            // before the checkpoint barrier arrives. If any partition is
+                            // still ACTIVE (no txnEnd received), it means upstream violated
+                            // this contract — fail fast rather than silently committing
+                            // partial transaction data.
                             List<Integer> activePartitions = partitionTracker.getActivePartitions();
                             if (!activePartitions.isEmpty()) {
-                                LOG.info("[MultiTxn] Savepoint with active partitions {} — " +
-                                        "will commit buffered data (at-least-once)", activePartitions);
+                                throw new IllegalStateException(
+                                        "[MultiTxn] Partitions " + activePartitions + " still have " +
+                                        "uncommitted transaction data at checkpoint. Upstream must " +
+                                        "ensure all transactions are complete before checkpoint barrier.");
                             }
 
                             // Ensure a shared transaction is open (may not be if no data
