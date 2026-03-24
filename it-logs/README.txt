@@ -4,3 +4,4 @@ Files:
 - multitable-it-20260324-150531.log — first full capture
 - multitable-it-20260324-153140.log — after pull 8c4325c (checkpoint IT fix)
 - multitable-it-20260324-155755.log — after pull ee69b41 (#15 transaction begin path)
+- multitable-it-20260324-161230.log — after pull 67fa6d6 (#16 StreamLoadSnapshot / transaction loader)
