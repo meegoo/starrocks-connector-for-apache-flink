@@ -24,6 +24,7 @@ import com.starrocks.connector.flink.table.sink.SinkFunctionFactory;
 import com.starrocks.connector.flink.table.sink.StarRocksSinkOptions;
 import com.starrocks.data.load.stream.properties.StreamLoadTableProperties;
 import org.apache.flink.api.common.RuntimeExecutionMode;
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -1144,6 +1145,7 @@ public class MultiTableTransactionITTest extends StarRocksITTestBase {
         env.setParallelism(parallelism);
         env.enableCheckpointing(1000);
         env.getCheckpointConfig().setCheckpointStorage(checkpointDir);
+        env.setRestartStrategy(RestartStrategies.noRestart());
         return env;
     }
 
