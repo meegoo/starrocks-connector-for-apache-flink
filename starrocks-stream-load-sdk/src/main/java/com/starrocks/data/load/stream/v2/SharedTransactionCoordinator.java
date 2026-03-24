@@ -70,11 +70,11 @@ public class SharedTransactionCoordinator {
      * Begins a shared transaction.
      *
      * <p>Generates a new label and issues a single {@code /api/transaction/begin}
-     * request to StarRocks. The label is then injected into all regions that have
-     * data to load.
+     * request to StarRocks at the database level (no table binding). The label is
+     * then injected into all regions that have data to load.
      *
      * @param database the database (all tables must be in the same database)
-     * @param anyTable any table in the database (StarRocks requires a table in begin)
+     * @param anyTable any table in the database (used only for label generation)
      */
     public synchronized void begin(String database, String anyTable) {
         LabelGenerator generator = labelGeneratorFactory.create(database, anyTable);
@@ -82,17 +82,16 @@ public class SharedTransactionCoordinator {
         this.database = database;
         this.table = anyTable;
 
-        LOG.info("[MultiTxn] SharedTransaction begin: label={}, db={}, table={}",
-                sharedLabel, database, anyTable);
+        LOG.info("[MultiTxn] SharedTransaction begin: label={}, db={}", sharedLabel, database);
 
         this.dataLoaded = false;
         this.beginTimeMs = System.currentTimeMillis();
 
-        boolean ok = streamLoader.beginTransaction(sharedLabel, database, anyTable);
+        boolean ok = streamLoader.beginTransaction(sharedLabel, database);
         if (!ok) {
             throw new StreamLoadFailException(
                     "Failed to begin shared transaction, label: " + sharedLabel +
-                    ", db: " + database + ", table: " + anyTable);
+                    ", db: " + database);
         }
     }
 

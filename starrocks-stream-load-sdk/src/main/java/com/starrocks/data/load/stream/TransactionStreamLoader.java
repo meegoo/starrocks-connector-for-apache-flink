@@ -128,8 +128,8 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
     }
 
     @Override
-    public boolean beginTransaction(String label, String database, String table) {
-        return doBegin(label, database, table);
+    public boolean beginTransaction(String label, String database) {
+        return doBegin(label, database, null);
     }
 
     protected boolean doBegin(TableRegion region) {
@@ -145,7 +145,9 @@ public class TransactionStreamLoader extends DefaultStreamLoader {
         httpPost.setHeaders(beginTxnHeader);
         httpPost.addHeader("label", label);
         httpPost.addHeader("db", database);
-        httpPost.addHeader("table", table);
+        if (table != null) {
+            httpPost.addHeader("table", table);
+        }
 
         httpPost.setConfig(RequestConfig.custom()
                         .setSocketTimeout(properties.getSocketTimeout())
