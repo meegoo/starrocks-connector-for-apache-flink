@@ -227,6 +227,19 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                           try {
                             LOG.info("[MultiTxn] Savepoint: completing shared transaction");
 
+                            // Upstream must ensure all source transactions are complete
+                            // before the checkpoint barrier arrives. If any partition is
+                            // still ACTIVE (no txnEnd received), it means upstream violated
+                            // this contract — fail fast rather than silently committing
+                            // partial transaction data.
+                            List<Integer> activePartitions = partitionTracker.getActivePartitions();
+                            if (!activePartitions.isEmpty()) {
+                                throw new IllegalStateException(
+                                        "[MultiTxn] Partitions " + activePartitions + " still have " +
+                                        "uncommitted transaction data at checkpoint. Upstream must " +
+                                        "ensure all transactions are complete before checkpoint barrier.");
+                            }
+
                             // Ensure a shared transaction is open (may not be if no data
                             // was written yet, or if we just finished a commit cycle).
                             if (!txnCoordinator.isActive() && !flushQ.isEmpty()) {
@@ -244,9 +257,10 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                     }
                                 }
                             }
-                            // Switch ALL regions' active chunks into inactive queues so
-                            // that any residual data (e.g. from partitions that never
-                            // reached txnEnd) is included in the shared transaction.
+
+                            // Switch and trigger loads for regions that have been through
+                            // trySwitchAndCommit() (TXN_END_RECEIVED or SWITCHED) but
+                            // may still have inactive chunks not yet sent.
                             for (TransactionTableRegion region : flushQ) {
                                 region.switchChunkForCommit();
                             }
