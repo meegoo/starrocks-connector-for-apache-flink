@@ -463,9 +463,6 @@ public class TransactionTableRegion implements TableRegion {
             if (numRetries >= maxRetries || !isRetryable(e)) {
                 LOG.error("Failed to flush data for db: {}, table: {} after {} times retry, the last exception is",
                         database, table, numRetries, e);
-                // Transition back to ACTIVE so the manager thread is not stuck
-                // waiting for a permanently-FLUSHING region.
-                state.set(State.ACTIVE);
                 manager.callback(firstException);
                 return;
             }
