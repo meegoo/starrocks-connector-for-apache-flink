@@ -44,6 +44,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 import static com.starrocks.data.load.stream.exception.ErrorUtils.isRetryable;
 
@@ -70,7 +71,7 @@ public class TransactionTableRegion implements TableRegion {
     private final AtomicLong cacheBytes = new AtomicLong();
     private final AtomicLong cacheRows = new AtomicLong();
     private final AtomicReference<State> state;
-    private final AtomicBoolean ctl = new AtomicBoolean(false);
+    private final AtomicBoolean writeLock = new AtomicBoolean(false);
     private final AtomicLong chunkIdGenerator = new AtomicLong(0);
     private volatile Chunk activeChunk;
     private final ConcurrentLinkedQueue<Chunk> inactiveChunks = new ConcurrentLinkedQueue<>();
@@ -110,11 +111,16 @@ public class TransactionTableRegion implements TableRegion {
         this.activeChunk = new Chunk(properties.getDataFormat(), chunkIdGenerator.getAndIncrement());
         this.maxRetries = maxRetries;
         this.retryIntervalInMs = retryIntervalInMs;
-        initHeaders(properties);
     }
 
     private void initHeaders(StreamLoadTableProperties properties) {
         headers.putAll(properties.getProperties());
+        // Include db and table headers so that transaction stream load
+        // (/api/transaction/load) routes data to the correct table.
+        // In multi-table transaction mode, each region targets a different
+        // table under the same shared label, so these headers are required.
+        headers.put("db", database);
+        headers.put("table", table);
         Optional<String> compressionType = properties.getProperty("compression");
         // To enable csv compression, at the connector side, the user need to set two properties:
         // "format = csv" and "compression = <compression type>". It needs to be converted to one
@@ -165,10 +171,17 @@ public class TransactionTableRegion implements TableRegion {
     }
 
     @Override
-    public void setLabel(String label) {
-        // Reuse the same label to avoid duplicate load if retry happens
+    public synchronized void setLabel(String label) {
+        // Guard against injecting a new shared label while a retry is in progress.
+        // numRetries is mutated under this same monitor (see fail()), so the check
+        // and the assignment are now atomic with respect to concurrent fail() calls.
         if (numRetries > 0 && label != null) {
-            return;
+            LOG.warn("[MultiTxn] setLabel called with label={} while numRetries={}, "
+                    + "existing label={}. Rejecting to preserve retry consistency.",
+                    label, numRetries, this.label);
+            throw new IllegalStateException(
+                    "Cannot set label while region is retrying (numRetries=" + numRetries
+                    + ", existingLabel=" + this.label + ", newLabel=" + label + ")");
         }
         this.label = label;
     }
@@ -181,6 +194,16 @@ public class TransactionTableRegion implements TableRegion {
     @Override
     public long getCacheBytes() {
         return cacheBytes.get();
+    }
+
+    /** Returns the current state as a string for logging purposes. */
+    public String getStateForLog() {
+        return state.get().name();
+    }
+
+    /** Returns {@code true} if the region is currently retrying a failed HTTP load. */
+    public synchronized boolean isRetrying() {
+        return numRetries > 0;
     }
 
     @Override
@@ -198,25 +221,32 @@ public class TransactionTableRegion implements TableRegion {
         return age.get();
     }
 
+    private static final int MAX_SPIN_ATTEMPTS = 10;
+    private static final long SPIN_BACKOFF_NANOS = 1000L; // 1 microsecond initial backoff
+
     @Override
     public int write(byte[] row) {
         if (row == null) {
             return 0;
         }
 
-        int c;
-        if (ctl.compareAndSet(false, true)) {
-            c = write0(row);
-        } else {
-            for (;;) {
-                if (ctl.compareAndSet(false, true)) {
-                    c = write0(row);
-                    break;
+        int spins = 0;
+        for (;;) {
+            if (writeLock.compareAndSet(false, true)) {
+                try {
+                    return write0(row);
+                } finally {
+                    writeLock.set(false);
                 }
             }
+            if (spins < MAX_SPIN_ATTEMPTS) {
+                Thread.yield();
+                spins++;
+            } else {
+                LockSupport.parkNanos(SPIN_BACKOFF_NANOS * (spins - MAX_SPIN_ATTEMPTS + 1));
+                spins++;
+            }
         }
-        ctl.set(false);
-        return c;
     }
 
     private void switchChunk() {
@@ -225,6 +255,61 @@ public class TransactionTableRegion implements TableRegion {
         }
         inactiveChunks.add(activeChunk);
         activeChunk = new Chunk(properties.getDataFormat(), chunkIdGenerator.getAndIncrement());
+    }
+
+    /**
+     * Called by the task thread when a txnEnd marker is received (multi-table mode).
+     *
+     * <p>Moves the active chunk to the inactive queue so the manager thread can
+     * flush it.  This runs on the task thread which is single-threaded in Flink,
+     * so there is no concurrent {@link #write(byte[])} call.
+     */
+    public void switchChunkForCommit() {
+        int spins = 0;
+        for (;;) {
+            if (writeLock.compareAndSet(false, true)) {
+                try {
+                    switchChunk();
+                } finally {
+                    writeLock.set(false);
+                }
+                LOG.debug("[MultiTxn] switchChunkForCommit: db={}, table={}, inactiveChunks={}",
+                        database, table, inactiveChunks.size());
+                return;
+            }
+            if (spins < MAX_SPIN_ATTEMPTS) {
+                Thread.yield();
+                spins++;
+            } else {
+                LockSupport.parkNanos(SPIN_BACKOFF_NANOS * (spins - MAX_SPIN_ATTEMPTS + 1));
+                spins++;
+            }
+        }
+    }
+
+    /**
+     * Called by the manager thread during the commitInFlight phase.
+     *
+     * <p>If the region has inactive chunks that have not yet been sent (state is ACTIVE),
+     * transitions to FLUSHING and starts the HTTP load.  This is different from
+     * {@link #flush(FlushReason)} in that it does NOT call {@link #switchChunk()} —
+     * the task thread has already done that via {@link #switchChunkForCommit()}.
+     *
+     * @return {@code true} if a load was triggered, {@code false} otherwise
+     */
+    public boolean triggerLoadIfNeeded() {
+        if (inactiveChunks.isEmpty()) {
+            // No data to load (region had no data when txnEnd arrived)
+            return false;
+        }
+        if (state.compareAndSet(State.ACTIVE, State.FLUSHING)) {
+            LOG.info("[MultiTxn] triggerLoadIfNeeded: db={}, table={}, label={}, inactiveChunks={}, cacheBytes={}",
+                    database, table, label, inactiveChunks.size(), cacheBytes.get());
+            streamLoad(0);
+            return true;
+        }
+        // Already FLUSHING or COMMITTING — load is in progress
+        return false;
     }
 
     protected int write0(byte[] row) {
@@ -255,18 +340,29 @@ public class TransactionTableRegion implements TableRegion {
         LOG.debug("Try to flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
                 database, table, label, cacheBytes, cacheRows, reason);
         if (state.compareAndSet(State.ACTIVE, State.FLUSHING)) {
+            int spins = 0;
             for (;;) {
-                if (ctl.compareAndSet(false, true)) {
-                    if (reason != FlushReason.BUFFER_ROWS_REACH_LIMIT ||
-                            activeChunk.numRows() >= properties.getMaxBufferRows()) {
-                        switchChunk();
+                if (writeLock.compareAndSet(false, true)) {
+                    try {
+                        if (reason != FlushReason.BUFFER_ROWS_REACH_LIMIT ||
+                                activeChunk.numRows() >= properties.getMaxBufferRows()) {
+                            switchChunk();
+                        }
+                    } finally {
+                        writeLock.set(false);
                     }
-                    ctl.set(false);
                     break;
+                }
+                if (spins < MAX_SPIN_ATTEMPTS) {
+                    Thread.yield();
+                    spins++;
+                } else {
+                    LockSupport.parkNanos(SPIN_BACKOFF_NANOS * (spins - MAX_SPIN_ATTEMPTS + 1));
+                    spins++;
                 }
             }
             if (!inactiveChunks.isEmpty()) {
-                LOG.info("Flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
+                LOG.debug("Flush db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}, reason: {}",
                         database, table, label, cacheBytes.get(), cacheRows.get(), reason);
                 streamLoad(0);
                 return true;
@@ -345,6 +441,7 @@ public class TransactionTableRegion implements TableRegion {
         } catch (Throwable e) {
             LOG.error("TransactionTableRegion commit failed, db: {}, table: {}, label: {}", database, table, label, e);
             fail(e);
+            return;
         }
 
         long commitTime = System.currentTimeMillis();
@@ -360,15 +457,18 @@ public class TransactionTableRegion implements TableRegion {
             firstException = e;
         }
 
-        if (numRetries >= maxRetries || !isRetryable(e)) {
-            LOG.error("Failed to flush data for db: {}, table: {} after {} times retry, the last exception is",
-                    database, table, numRetries, e);
-            manager.callback(firstException);
-            return;
+        // Synchronize on 'this' so that the numRetries increment is atomic with
+        // respect to the check in setLabel(), preventing label injection mid-retry.
+        synchronized (this) {
+            if (numRetries >= maxRetries || !isRetryable(e)) {
+                LOG.error("Failed to flush data for db: {}, table: {} after {} times retry, the last exception is",
+                        database, table, numRetries, e);
+                manager.callback(firstException);
+                return;
+            }
+            responseFuture = null;
+            numRetries += 1;
         }
-
-        responseFuture = null;
-        numRetries += 1;
         LOG.warn("Failed to flush data for db: {}, table: {}, and will retry for {} times after {} ms",
                 database, table, numRetries, retryIntervalInMs, e);
         streamLoad(retryIntervalInMs);
@@ -382,17 +482,19 @@ public class TransactionTableRegion implements TableRegion {
         response.setFlushBytes(chunk.rowBytes());
         response.setFlushRows(chunk.numRows());
         manager.callback(response);
-        numRetries = 0;
-        firstException = null;
+        synchronized (this) {
+            numRetries = 0;
+            firstException = null;
+        }
 
         if (!inactiveChunks.isEmpty()) {
-            LOG.info("Stream load continue, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
+            LOG.debug("Stream load continue, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
                     database, table, label, cacheBytes, cacheRows);
             streamLoad(0);
             return;
         }
         if (state.compareAndSet(State.FLUSHING, State.ACTIVE)) {
-            LOG.info("Stream load completed, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
+            LOG.debug("Stream load completed, db: {}, table: {}, label: {}, cacheBytes: {}, cacheRows: {}",
                     database, table, label, cacheBytes, cacheRows);
         }
     }
@@ -405,17 +507,27 @@ public class TransactionTableRegion implements TableRegion {
     protected void streamLoad(int delayMs) {
         try {
             Chunk chunk = inactiveChunks.peek();
-            LOG.info("Stream load chunk, db: {}, table: {}, numRows: {}, rowBytes: {}, chunkBytes: {}",
+            if (chunk == null) {
+                LOG.warn("No inactive chunk available for stream load, db: {}, table: {}", database, table);
+                state.compareAndSet(State.FLUSHING, State.ACTIVE);
+                return;
+            }
+            LOG.debug("Stream load chunk, db: {}, table: {}, numRows: {}, rowBytes: {}, chunkBytes: {}",
                     database, table, chunk.numRows(), chunk.rowBytes(), chunk.chunkBytes());
             responseFuture = streamLoader.send(this, delayMs);
         } catch (Exception e) {
+            state.compareAndSet(State.FLUSHING, State.ACTIVE);
             fail(e);
         }
     }
 
     @Override
     public HttpEntity getHttpEntity() {
-        ChunkHttpEntity entity = new ChunkHttpEntity(uniqueKey, inactiveChunks.peek());
+        Chunk chunk = inactiveChunks.peek();
+        if (chunk == null) {
+            throw new IllegalStateException("No inactive chunk available for HTTP entity, db: " + database + ", table: " + table);
+        }
+        ChunkHttpEntity entity = new ChunkHttpEntity(uniqueKey, chunk);
         return compressionCodec
                 .map(codec -> (HttpEntity) new CompressionHttpEntity(entity, codec))
                 .orElse(entity);

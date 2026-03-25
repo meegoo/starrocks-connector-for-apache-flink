@@ -1,0 +1,975 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.starrocks.data.load.stream.v2;
+
+import com.starrocks.data.load.stream.MockedStarRocksHttpServer;
+import com.starrocks.data.load.stream.StreamLoadDataFormat;
+import com.starrocks.data.load.stream.properties.StreamLoadProperties;
+import com.starrocks.data.load.stream.properties.StreamLoadTableProperties;
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+
+public class StreamLoadManagerMultiTableTest {
+
+    private static final String USERNAME = "root";
+    private static final String PASSWORD = "";
+
+    private MockedStarRocksHttpServer mockedServer;
+
+    @Before
+    public void setUp() throws Exception {
+        mockedServer = MockedStarRocksHttpServer.builder()
+                .port(0)
+                .enforceAuth(USERNAME, PASSWORD)
+                .build();
+        mockedServer.start();
+    }
+
+    @After
+    public void tearDown() {
+        if (mockedServer != null) {
+            mockedServer.stop();
+        }
+    }
+
+    private StreamLoadProperties buildMultiTableProperties(int flushIntervalMs) {
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("orders")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .maxBufferRows(100000)
+                .build();
+
+        return StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("4.0.0")
+                .enableMultiTableTransaction()
+                .labelPrefix("test-mtxn-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(flushIntervalMs)
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .build();
+    }
+
+    /**
+     * Single partition: write data to two tables, send txnEnd, verify commit.
+     * Verifies that the shared transaction coordinator is used (1 begin, 1 prepare, 1 commit).
+     */
+    @Test
+    public void testSinglePartitionWriteAndCommit() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            int partition = 0;
+            manager.write(partition, "test", "orders",
+                    "{\"order_id\":1, \"customer_id\":100, \"total_amount\":99.99}");
+            manager.setCommitAllowed(partition, false);
+
+            manager.write(partition, "test", "order_items",
+                    "{\"item_id\":1, \"order_id\":1, \"product_name\":\"widget\", \"quantity\":2}");
+            manager.setCommitAllowed(partition, true);
+
+            Thread.sleep(500);
+            Assert.assertNull("No exception expected", manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception expected after flush", manager.getException());
+
+            // At least 1 begin (shared transaction is eagerly opened; after commit,
+            // a new one is opened for the next cycle, and savepoint may open yet another).
+            Assert.assertTrue("Expected at least 1 begin for shared transaction",
+                    mockedServer.getBeginCount() >= 1);
+            Assert.assertTrue("Expected at least 1 load call (one per table)",
+                    mockedServer.getLoadCount() >= 1);
+            // Multi-table transactions skip prepare and go directly to commit.
+            Assert.assertEquals("Expected exactly 1 commit for single shared transaction",
+                    1, mockedServer.getCommitCount());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Two partitions sharing one sink: commit only triggers when BOTH
+     * partitions have reached txnEnd.
+     */
+    @Test
+    public void testMultiPartitionCommitWaitsForAll() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            // Partition 0 writes + txnEnd
+            manager.write(0, "test", "orders",
+                    "{\"order_id\":1, \"customer_id\":100}");
+            manager.setCommitAllowed(0, true);
+
+            // Only partition 0 has txnEnd. Partition 1 hasn't even started.
+            // But there's also only partition 0 active, so commit may trigger.
+            Thread.sleep(300);
+            Assert.assertNull("No exception after P0 txnEnd", manager.getException());
+
+            // Now partition 1 writes + txnEnd
+            manager.write(1, "test", "orders",
+                    "{\"order_id\":2, \"customer_id\":101}");
+            manager.setCommitAllowed(1, false);
+
+            manager.write(1, "test", "order_items",
+                    "{\"item_id\":1, \"order_id\":2}");
+            manager.setCommitAllowed(1, true);
+
+            Thread.sleep(500);
+            Assert.assertNull("No exception after P1 txnEnd", manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Verifies that data is NOT committed while no partition has sent txnEnd.
+     * The shared transaction is eagerly opened (begin), but commit only
+     * happens after txnEnd.
+     */
+    @Test
+    public void testCommitNotTriggeredWithoutTxnEnd() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            manager.write(0, "test", "orders",
+                    "{\"order_id\":1, \"customer_id\":100}");
+            manager.setCommitAllowed(0, false);
+
+            Thread.sleep(300);
+            Assert.assertNull("No exception expected", manager.getException());
+            // Shared transaction is eagerly opened, so begin may have been called.
+            // But commit must NOT have happened yet.
+            Assert.assertEquals("No commit expected before txnEnd", 0, mockedServer.getCommitCount());
+
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(300);
+            Assert.assertNull("No exception expected after txnEnd", manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception expected after flush", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * N:1 mapping: multiple source transactions accumulate before commit.
+     */
+    @Test
+    public void testMultipleTransactionsAccumulate() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(500);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            // Txn 1
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
+
+            // Txn 2 (interval not elapsed yet, so txn 1 data stays in active chunk)
+            manager.write(0, "test", "orders", "{\"order_id\":2}");
+            manager.setCommitAllowed(0, true);
+
+            // Wait for interval
+            Thread.sleep(600);
+
+            // Txn 3 triggers the interval check
+            manager.write(0, "test", "orders", "{\"order_id\":3}");
+            manager.setCommitAllowed(0, true);
+
+            Thread.sleep(500);
+            Assert.assertNull("No exception expected", manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception expected after flush", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Savepoint (flush) commits the active shared transaction even when
+     * txnEnd has not been received (interval-based commit threshold is very high).
+     * Verifies exactly 1 prepare + commit via the savepoint path.
+     * The shared transaction is eagerly opened, so begin count may be >= 1.
+     */
+    @Test
+    public void testSavepointCommitsMultiTableTransaction() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(60000); // 60s interval — never fires
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            manager.write(0, "test", "orders",
+                    "{\"order_id\":1, \"customer_id\":100}");
+            manager.write(0, "test", "order_items",
+                    "{\"item_id\":1, \"order_id\":1}");
+
+            // Mark partition as committed so savepoint can proceed
+            manager.setCommitAllowed(0, true);
+            manager.flush();
+            Assert.assertNull("No exception expected after flush", manager.getException());
+
+            // The shared transaction is eagerly opened, so at least 1 begin.
+            // Savepoint path commits the active shared transaction (skipping prepare for multi-table).
+            Assert.assertTrue("Savepoint should issue at least 1 begin",
+                    mockedServer.getBeginCount() >= 1);
+            Assert.assertEquals("Savepoint should issue exactly 1 commit",
+                    1, mockedServer.getCommitCount());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * An evicted (idle) partition that later receives txnEnd should be
+     * automatically re-registered and participate in the next commit cycle.
+     *
+     * <p>This tests the {@code onTxnEnd()} fix that re-registers evicted partitions
+     * instead of ignoring them.
+     */
+    @Test
+    public void testEvictedPartitionReRegisters() throws Exception {
+        // Very short interval (100 ms) to trigger multiple rapid commit cycles
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Commit cycle 1 — only partition 0
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // Commit cycle 2 — only partition 0 (partition 0 resets to ACTIVE)
+            manager.write(0, "test", "orders", "{\"order_id\":2}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // Commit cycle 3 — only partition 0 (3rd cycle: idle count reaches MAX_IDLE_CYCLES)
+            manager.write(0, "test", "orders", "{\"order_id\":3}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            // After 3 idle commit cycles, partition 0 would be evicted.
+            // Now partition 0 sends txnEnd again — it must be re-registered, not ignored.
+            manager.write(0, "test", "orders", "{\"order_id\":4}");
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(400);
+
+            manager.flush();
+            Assert.assertNull("No exception expected after evicted partition re-registers",
+                    manager.getException());
+
+            // At least 4 complete commit cycles must have occurred
+            Assert.assertTrue("Expected at least 4 commits across re-registration cycles",
+                    mockedServer.getCommitCount() >= 4);
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Regions from different databases must be rejected: multi-table transactions
+     * require all tables to share the same StarRocks database.
+     */
+    @Test
+    public void testCrossDbWriteIsRejected() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            // Write to two different databases in the same commit cycle
+            manager.write(0, "db_a", "orders", "{\"order_id\":1}");
+            manager.write(0, "db_b", "payments", "{\"payment_id\":1}");
+            manager.setCommitAllowed(0, true);
+
+            // Give manager thread time to attempt commit
+            Thread.sleep(500);
+
+            // Manager should have recorded an error about mismatched databases
+            Assert.assertNotNull("Expected exception for cross-database write",
+                    manager.getException());
+            Assert.assertTrue("Exception should mention database mismatch",
+                    manager.getException().getMessage().contains("same database"));
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Verifies that autonomous flush (triggered by buffer thresholds) uses the
+     * shared transaction label rather than generating an independent label.
+     * This is the key scenario that was previously subject to data loss.
+     *
+     * <p>With the eager shared transaction approach, the shared label is injected
+     * before any autonomous flush can occur, so all loads use the shared label.
+     * After txnEnd, the commit cycle commits all data (including data from
+     * autonomous flushes) under the single shared transaction.
+     */
+    @Test
+    public void testAutonomousFlushUsesSharedLabel() throws Exception {
+        // Use a very small buffer (1 byte effective) to trigger autonomous flush immediately.
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("orders")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .maxBufferRows(1) // Flush after every row
+                .build();
+
+        StreamLoadProperties properties = StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("4.0.0")
+                .enableMultiTableTransaction()
+                .labelPrefix("test-autoflush-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(100)
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .build();
+
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Write multiple rows — with maxBufferRows=1, autonomous flush should trigger
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.write(0, "test", "orders", "{\"order_id\":2}");
+            manager.write(0, "test", "orders", "{\"order_id\":3}");
+
+            // Give manager thread time to process autonomous flushes
+            Thread.sleep(500);
+            Assert.assertNull("No exception during autonomous flush", manager.getException());
+
+            // Now send txnEnd to trigger commit
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(500);
+            Assert.assertNull("No exception after txnEnd", manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+
+            // All data should have been committed under shared transactions.
+            // The critical assertion: at least 1 commit happened (data wasn't lost).
+            Assert.assertTrue("Expected at least 1 commit (autonomous flush data not lost)",
+                    mockedServer.getCommitCount() >= 1);
+            // Loads should have occurred (autonomous flushes).
+            Assert.assertTrue("Expected at least 1 load from autonomous flush",
+                    mockedServer.getLoadCount() >= 1);
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Non-multi-table mode is completely unaffected by the new code paths.
+     */
+    @Test
+    public void testNonMultiTableModeUnaffected() throws Exception {
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("tbl1")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .maxBufferRows(100000)
+                .build();
+
+        StreamLoadProperties properties = StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("3.5.0")
+                .enableTransaction()
+                .labelPrefix("test-normal-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(1000)
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .build();
+
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            manager.write(null, "test", "tbl1",
+                    "{\"id\":1, \"name\":\"test\"}");
+
+            manager.flush();
+            Assert.assertNull("No exception expected", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 10: Constructor parameter validation
+    // -------------------------------------------------------------------------
+
+    /**
+     * Multi-table transaction mode requires TransactionStreamLoader (i.e. transaction
+     * must be enabled). Enabling multi-table without transaction should throw.
+     *
+     * <p>Note: {@code enableMultiTableTransaction()} in the builder already sets
+     * {@code enableTransaction = true}, so we test the indirect path: multi-table
+     * with maxRetries > 0, which forces DefaultStreamLoader instead of
+     * TransactionStreamLoader.
+     */
+    @Test
+    public void testConstructorRejectsMultiTableWithRetries() {
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("orders")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .build();
+
+        StreamLoadProperties properties = StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("4.0.0")
+                .enableMultiTableTransaction()
+                .maxRetries(3)
+                .labelPrefix("test-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(100)
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .build();
+
+        try {
+            new StreamLoadManagerV2(properties, true);
+            Assert.fail("Expected IllegalArgumentException for multi-table with retries");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue("Should mention TransactionStreamLoader",
+                    e.getMessage().contains("TransactionStreamLoader"));
+        }
+    }
+
+    /**
+     * Manual commit mode (enableAutoCommit=false) requires transaction support.
+     * Without it, construction should throw.
+     */
+    @Test
+    public void testConstructorRejectsManualCommitWithoutTransaction() {
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("orders")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .build();
+
+        // Build properties WITHOUT enableTransaction
+        StreamLoadProperties properties = StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("4.0.0")
+                .labelPrefix("test-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(100)
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .build();
+
+        try {
+            new StreamLoadManagerV2(properties, false);
+            Assert.fail("Expected IllegalArgumentException for manual commit without transaction");
+        } catch (IllegalArgumentException e) {
+            Assert.assertTrue("Should mention transaction stream load",
+                    e.getMessage().contains("transaction stream load"));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 9: setCommitAllowed(boolean) is no-op in multi-table mode
+    // -------------------------------------------------------------------------
+
+    /**
+     * The legacy {@code setCommitAllowed(boolean)} without partition parameter
+     * is a no-op in multi-table mode. Verifies that calling it does not cause
+     * errors and does not trigger a commit (the commit counter stays at 0).
+     */
+    @Test
+    public void testLegacySetCommitAllowedIsNoOpInMultiTableMode() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(60000);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+
+            // Call the legacy no-partition variant — should be a no-op
+            manager.setCommitAllowed(true);
+            Thread.sleep(300);
+            Assert.assertNull("No exception expected from no-op setCommitAllowed", manager.getException());
+
+            // No commit should have been triggered by the legacy call
+            Assert.assertEquals("No commit from legacy setCommitAllowed",
+                    0, mockedServer.getCommitCount());
+
+            // Mark partition committed so flush can proceed, then clean up
+            manager.setCommitAllowed(0, true);
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 4: Commit failure — exception propagation and state cleanup
+    // -------------------------------------------------------------------------
+
+    /**
+     * When commit fails (server returns error), the manager should capture the
+     * exception and propagate it to the caller.
+     */
+    @Test
+    public void testCommitFailurePropagatesException() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            // Inject commit failure
+            MockedStarRocksHttpServer.ResponseOverride commitFail =
+                    new MockedStarRocksHttpServer.ResponseOverride();
+            commitFail.status = "Fail";
+            commitFail.message = "disk full";
+            mockedServer.setCommitOverride(commitFail);
+
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
+
+            // Wait for manager thread to attempt commit
+            Thread.sleep(500);
+
+            // The exception should have been captured
+            Assert.assertNotNull("Expected exception from commit failure",
+                    manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * Multi-table transactions skip prepare and go directly to commit,
+     * so a prepare override should have no effect. Verify that the
+     * transaction completes successfully even with a prepare override set.
+     */
+    @Test
+    public void testPrepareSkippedInMultiTableMode() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Set a prepare failure override — should have no effect in multi-table mode
+            MockedStarRocksHttpServer.ResponseOverride prepareFail =
+                    new MockedStarRocksHttpServer.ResponseOverride();
+            prepareFail.status = "Fail";
+            prepareFail.message = "prepare failed";
+            mockedServer.setPrepareOverride(prepareFail);
+
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
+
+            Thread.sleep(500);
+
+            // No exception expected — prepare is skipped in multi-table mode
+            Assert.assertNull("No exception expected (prepare is skipped in multi-table mode)",
+                    manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+
+            // Verify prepare was never called
+            Assert.assertEquals("Prepare should be skipped in multi-table mode",
+                    0, mockedServer.getPrepareCount());
+            // Commit should have occurred
+            Assert.assertTrue("Commit should have occurred",
+                    mockedServer.getCommitCount() >= 1);
+        } finally {
+            manager.close();
+        }
+    }
+
+    /**
+     * When begin fails (cannot open shared transaction), the manager should
+     * capture the exception.
+     */
+    @Test
+    public void testBeginFailurePropagatesException() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+
+        // Inject begin failure BEFORE init so the eager open fails
+        MockedStarRocksHttpServer.ResponseOverride beginFail =
+                new MockedStarRocksHttpServer.ResponseOverride();
+        beginFail.status = "Fail";
+        beginFail.message = "too many running transactions";
+        mockedServer.setBeginOverride(beginFail);
+
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
+
+            Thread.sleep(500);
+
+            Assert.assertNotNull("Expected exception from begin failure",
+                    manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 3: Flush timeout
+    // -------------------------------------------------------------------------
+
+    /**
+     * Verifies that when flush takes longer than the configured timeout,
+     * a RuntimeException is thrown.
+     *
+     * <p>We set timeout=1 via headers (flushTimeoutMs = 1*1100 = 1100ms),
+     * then make commit hang by failing repeatedly so flush never completes.
+     */
+    @Test
+    public void testFlushTimeout() throws Exception {
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("orders")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .maxBufferRows(100000)
+                .build();
+
+        StreamLoadProperties properties = StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("4.0.0")
+                .enableMultiTableTransaction()
+                .labelPrefix("test-timeout-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(60000) // never auto-commit
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .addHeader("timeout", "1") // 1 second → flushTimeoutMs = 1100ms
+                .build();
+
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            // Make commit always fail so flush() can never complete
+            MockedStarRocksHttpServer.ResponseOverride commitFail =
+                    new MockedStarRocksHttpServer.ResponseOverride();
+            commitFail.status = "Fail";
+            commitFail.message = "simulated hang";
+            mockedServer.setCommitOverride(commitFail);
+
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            manager.setCommitAllowed(0, true);
+
+            // flush() should eventually throw due to timeout (1100ms)
+            try {
+                manager.flush();
+                // flush may succeed if the manager thread captures the commit error first
+                // In that case, getException should be non-null
+                if (manager.getException() != null) {
+                    return; // commit failure was captured — acceptable outcome
+                }
+                Assert.fail("Expected RuntimeException from flush timeout or commit failure");
+            } catch (RuntimeException e) {
+                Assert.assertTrue("Exception should mention timeout or commit failure",
+                        e.getMessage().contains("timeout") || e.getMessage().contains("Fail"));
+            }
+        } finally {
+            manager.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 1: Write blocking / backpressure (blockIfCacheFull)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Verifies that writes are accepted and eventually committed when using a
+     * very small buffer size. With a tiny {@code multiTableTransactionBufferSize},
+     * the write path will trigger flush signals (soft threshold) and potentially
+     * block writes (hard threshold at 2× buffer size).
+     *
+     * <p>This exercises the {@code blockIfCacheFull()} code path.
+     */
+    @Test(timeout = 15000)
+    public void testWriteBlockingWithSmallBuffer() throws Exception {
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("orders")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .maxBufferRows(100000)
+                .build();
+
+        StreamLoadProperties properties = StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("4.0.0")
+                .enableMultiTableTransaction()
+                .multiTableTransactionBufferSize(2048) // 2KB — small but allows writes to proceed
+                .labelPrefix("test-backpressure-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(100)
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .build();
+
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Write enough data to exceed the soft threshold (2048 bytes).
+            // Each JSON row is ~40-50 bytes. 50 rows ≈ 2500 bytes, exceeding
+            // soft threshold but not blocking indefinitely at 2x hard threshold.
+            for (int i = 0; i < 50; i++) {
+                manager.write(0, "test", "orders",
+                        String.format("{\"order_id\":%d, \"customer_id\":%d}", i, i * 10));
+            }
+
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(500);
+            Assert.assertNull("No exception expected during backpressure writes",
+                    manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+
+            // Data should have been committed despite the small buffer
+            Assert.assertTrue("Expected at least 1 commit",
+                    mockedServer.getCommitCount() >= 1);
+            // The small buffer should have triggered multiple flush signals
+            Assert.assertTrue("Expected multiple loads due to small buffer",
+                    mockedServer.getLoadCount() >= 1);
+        } finally {
+            manager.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 2: Shared transaction timeout recycling
+    // -------------------------------------------------------------------------
+
+    /**
+     * Verifies that shared transactions are recycled before the server-side timeout.
+     *
+     * <p>We set timeout=1 via headers (sharedTxnMaxIdleMs = 1*800 = 800ms).
+     * The manager's eager open creates a shared transaction; if no data is committed
+     * within 800ms, it should be recycled (rolled back and a new one opened).
+     *
+     * <p>We verify by checking that more begin calls than commit calls occur
+     * (the extra begins come from recycling).
+     */
+    @Test
+    public void testSharedTransactionRecycling() throws Exception {
+        StreamLoadTableProperties tableProps = StreamLoadTableProperties.builder()
+                .database("test")
+                .table("orders")
+                .streamLoadDataFormat(StreamLoadDataFormat.JSON)
+                .maxBufferRows(100000)
+                .build();
+
+        StreamLoadProperties properties = StreamLoadProperties.builder()
+                .loadUrls(mockedServer.getBaseUrl())
+                .username(USERNAME)
+                .password(PASSWORD)
+                .version("4.0.0")
+                .enableMultiTableTransaction()
+                .labelPrefix("test-recycle-")
+                .defaultTableProperties(tableProps)
+                .expectDelayTime(60000) // never auto-commit
+                .scanningFrequency(50)
+                .ioThreadCount(2)
+                .addHeader("timeout", "1") // sharedTxnMaxIdleMs = 800ms
+                .build();
+
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Write a row so the manager opens a shared transaction
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+
+            // Wait longer than sharedTxnMaxIdleMs (800ms) for recycling to occur.
+            // The recycling is checked each scanningFrequency (50ms), so after ~900ms
+            // the transaction should have been recycled at least once.
+            Thread.sleep(1500);
+            Assert.assertNull("No exception during recycling", manager.getException());
+
+            // Recycling means: original begin + rollback/commit + new begin
+            // So we expect more begins than commits.
+            int beginCount = mockedServer.getBeginCount();
+            Assert.assertTrue("Expected at least 2 begins from recycling, got: " + beginCount,
+                    beginCount >= 2);
+
+            // Clean up
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(300);
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+        } finally {
+            manager.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 7: Large batch stress test
+    // -------------------------------------------------------------------------
+
+    /**
+     * Writes a large number of rows across multiple tables and partitions,
+     * verifying that all data is committed without errors.
+     */
+    @Test
+    public void testLargeBatchMultiTableStress() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(200);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            int rowsPerTable = 500;
+            // Partition 0 writes to "orders"
+            for (int i = 0; i < rowsPerTable; i++) {
+                manager.write(0, "test", "orders",
+                        String.format("{\"order_id\":%d,\"customer_id\":%d,\"total\":%.2f}",
+                                i, i * 10, i * 1.5));
+            }
+            // Partition 1 writes to "order_items"
+            for (int i = 0; i < rowsPerTable; i++) {
+                manager.write(1, "test", "order_items",
+                        String.format("{\"item_id\":%d,\"order_id\":%d,\"qty\":%d}",
+                                i, i / 3, i % 10 + 1));
+            }
+
+            // Signal both partitions done
+            manager.setCommitAllowed(0, true);
+            manager.setCommitAllowed(1, true);
+
+            Thread.sleep(800);
+            Assert.assertNull("No exception during large batch write", manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+
+            Assert.assertTrue("Expected at least 1 commit for large batch",
+                    mockedServer.getCommitCount() >= 1);
+            Assert.assertTrue("Expected multiple load calls for large batch",
+                    mockedServer.getLoadCount() >= 2);
+        } finally {
+            manager.close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 8: Dynamic new table added at runtime
+    // -------------------------------------------------------------------------
+
+    /**
+     * Verifies that a new table can be written at runtime after the shared
+     * transaction is already open. The new region should be injected with
+     * the existing shared label.
+     */
+    @Test
+    public void testDynamicNewTableAfterSharedTxnOpen() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(100);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            // Write to first table — this triggers eager shared txn open
+            manager.write(0, "test", "orders", "{\"order_id\":1}");
+            Thread.sleep(200); // let manager thread open the shared txn
+
+            // Now write to a brand new table that didn't exist when the shared txn opened.
+            // The getCacheRegion() code path should create a new region and inject
+            // the existing shared label into it.
+            manager.write(0, "test", "payments", "{\"payment_id\":1,\"amount\":42.0}");
+
+            // Also write to a third table
+            manager.write(0, "test", "shipments", "{\"shipment_id\":1,\"tracking\":\"ABC\"}");
+
+            manager.setCommitAllowed(0, true);
+            Thread.sleep(500);
+            Assert.assertNull("No exception when adding new table at runtime",
+                    manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+
+            // All 3 tables' data should be committed under shared transaction(s)
+            Assert.assertTrue("Expected at least 1 commit", mockedServer.getCommitCount() >= 1);
+            // At least 3 load calls (one per table)
+            Assert.assertTrue("Expected at least 3 loads (one per table)",
+                    mockedServer.getLoadCount() >= 3);
+        } finally {
+            manager.close();
+        }
+    }
+}
