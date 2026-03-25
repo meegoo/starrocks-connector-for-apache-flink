@@ -1,6 +1,6 @@
 # AGENT.md — AI Agent 工作说明（Flink Connector for StarRocks）
 
-本文件为 Cloud / Coding Agent 的**持久化技能入口**：执行集成测试与构建时**优先遵循本文**，细节与完整说明以 `docs/` 为准并保持同步更新。
+本文件为 Cloud / Coding Agent 的**持久化技能入口**：执行集成测试与构建时**优先遵循本文**；产品/设计说明见 `docs/` 下其余文档。
 
 ---
 
@@ -8,11 +8,11 @@
 
 | 文档 | 用途 |
 |------|------|
-| [docs/CLOUD_AGENTS_SKILL.md](docs/CLOUD_AGENTS_SKILL.md) | 构建、单测、集成测试、TSP / SSH / Docker、常见问题（**权威长文档**） |
+| **本文件（AGENT.md）** | 构建前置、集成测试分套件、TSP/SSH/Docker 运行方式、超时与排障要点 |
 | [docs/multi-table-transaction-stream-load-en.md](docs/multi-table-transaction-stream-load-en.md) | 多表事务 Stream Load 设计、配置项、约束（英文） |
 | [docs/content/connector-sink.md](docs/content/connector-sink.md) / [connector-source.md](docs/content/connector-source.md) | Sink / Source 能力说明 |
 
-**约定**：集成测试流程、环境变量或 `-Dtest` 清单变更时，须**同时**更新本文件与 `docs/CLOUD_AGENTS_SKILL.md` 中对应小节（见该文档 §8）。
+**约定**：集成测试流程、环境变量或 `-Dtest` 清单变更时，须同步更新本 **AGENT.md** 对应小节。
 
 ---
 
@@ -28,7 +28,7 @@ cd starrocks-stream-load-sdk && mvn -B install -Dmaven.javadoc.skip=true -DskipT
 
 ### 2.2 JDK 版本
 
-集成测试与 Arrow 等依赖在 **JDK 8** 下验证；远程节点仅有 JDK 11/17 时，使用 `docs/CLOUD_AGENTS_SKILL.md` §7.5 中的 `maven:3.8-eclipse-temurin-8` 容器运行 Maven。
+集成测试与 Arrow 等依赖在 **JDK 8** 下验证；远程节点仅有 JDK 11/17 时，使用 **`maven:3.8-eclipse-temurin-8`** 容器运行 Maven（见 §4）。
 
 ### 2.3 外部 StarRocks 集群（跳过 Testcontainers）
 
@@ -41,7 +41,7 @@ cd starrocks-stream-load-sdk && mvn -B install -Dmaven.javadoc.skip=true -DskipT
 | `SR_USERNAME` | `it.starrocks.username` | 默认 `root` |
 | `SR_PASSWORD` | `it.starrocks.password` | 可为空 |
 
-完整表格与 TSP 流程见 [docs/CLOUD_AGENTS_SKILL.md](docs/CLOUD_AGENTS_SKILL.md) §3.2、§7。
+TSP 申请集群：在已配置 `TSP_HOST` / `TSP_USERNAME` / `TSP_PASSWORD` 的构建机上，使用主 **StarRocks** 仓库中的 **`tools/tsp_quick_apply.sh`**（如 `--apply-from 7011`、`--get-address <cluster>`）获取 `SR_FE`，再导出 `SR_HTTP_URLS` / `SR_JDBC_URLS`（见 §4 环境变量）。
 
 ---
 
@@ -93,7 +93,7 @@ mvn -B test -DskipTests=false \
 
 ## 4. 远程节点（SSH）+ Docker 内跑 IT（摘要）
 
-与 [docs/CLOUD_AGENTS_SKILL.md](docs/CLOUD_AGENTS_SKILL.md) **§7** 一致。典型环境变量：`SSH_HOST`、`SSH_USERNAME`、`SSH_PASSWORD`；远程仓库路径以实际为准（文档示例：`/home/disk4/hujie/src/starrocks-connector-for-apache-flink`）。
+典型环境变量：`SSH_HOST`、`SSH_USERNAME`、`SSH_PASSWORD`；TSP：`TSP_HOST`、`TSP_USERNAME`、`TSP_PASSWORD`。远程仓库路径以实际为准（示例：`/home/disk4/hujie/src/starrocks-connector-for-apache-flink`）。
 
 1. `ssh` 到远程后：`git fetch && git checkout <branch> && git pull`。
 2. `FE_HOST` 为 FE IP（无协议、无 JDBC 前缀）；HTTP 端口 **8030**，MySQL 协议端口 **9030**。
@@ -123,7 +123,7 @@ $REMOTE_SSH "sudo docker run --rm \
 
 ## 5. Agent 行为检查清单
 
-- [ ] 已读或与任务相关的 `docs/CLOUD_AGENTS_SKILL.md` 小节。
+- [ ] 已读或与任务相关的 **AGENT.md** 小节。
 - [ ] 运行根目录 IT 前已 `install` **starrocks-stream-load-sdk**（§2.1）。
 - [ ] 使用外部集群时已设置 `SR_HTTP_URLS` + `SR_JDBC_URLS`（或等价系统属性）。
 - [ ] 在嵌套 Docker 中未挂载 `docker.sock` 时，**勿**将 `KafkaToStarRocksITTest` 加入 `-Dtest`（§3.3、§4）。
@@ -131,4 +131,4 @@ $REMOTE_SSH "sudo docker run --rm \
 
 ---
 
-*与 `docs/CLOUD_AGENTS_SKILL.md` 配套使用；二者冲突时以仓库内最新提交为准，并应合并修正。*
+*以本仓库最新提交为准。*
