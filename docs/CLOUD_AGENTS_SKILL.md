@@ -2,6 +2,8 @@
 
 面向 Cloud Agents 的最小运行与测试指南。按代码库分区组织，提供可执行的测试流程与常用环境/工作流说明。
 
+**仓库根目录 [AGENT.md](../AGENT.md)**：面向 AI Agent 的持久化技能入口（集成测试 `-Dtest` 分套件、嵌套 Docker 限制、与本文交叉索引）。详细步骤仍以本文为准；二者应同步维护。
+
 ---
 
 ## 1. 环境与前置条件
@@ -129,6 +131,27 @@ mvn test -Dtest=StarRocksSinkITTest -Dit.starrocks.platform=linux/arm64 -DskipTe
 
 IT 需要 Docker 和足够内存（约 8 分钟启动超时）。无容器且未配置外部集群时，IT 会因连接失败而跳过。
 
+#### 3.2.1 按测试类选择 `-Dtest`（与 AGENT.md 一致）
+
+运行根目录 IT 前须先安装 SDK，见 §2.1 或 [AGENT.md](../AGENT.md) §2。
+
+| 套件 | `-Dtest` 取值要点 | 说明 |
+|------|-------------------|------|
+| **多表事务** | `MultiTableTransactionITTest` | 需 StarRocks ≥ 4.0；设计与配置见 [multi-table-transaction-stream-load-en.md](multi-table-transaction-stream-load-en.md) |
+| **非 multi-table（不含 Kafka）** | `StarRocksSinkITTest,StarRocksDynamicTableSinkITTest,StarRocksGenericSinkITTest,StarRocksSourceITTest,StarRocksDynamicTableSourceITTest,StarRocksCatalogTest,FlinkCatalogTest,com.starrocks.connector.flink.it.container.StarRocksITTest` | 适用于 **Maven 跑在 Docker 内且未挂载 `docker.sock`** 的场景 |
+| **Kafka IT** | 在上述列表末尾追加 `,com.starrocks.connector.flink.it.sink.kafka.KafkaToStarRocksITTest` | 依赖 Testcontainers 再启容器；嵌套 Docker 中若未挂载宿主机 socket，会报 `Could not find a valid Docker environment` |
+
+示例（外部集群 + 多表 IT）：
+
+```bash
+export SR_HTTP_URLS="<fe_host>:8030"
+export SR_JDBC_URLS="jdbc:mysql://<fe_host>:9030"
+cd starrocks-stream-load-sdk && mvn -B install -Dmaven.javadoc.skip=true -DskipTests && cd ..
+mvn -B test -DskipTests=false -Dtest=MultiTableTransactionITTest
+```
+
+**单方法 + 短超时**：`-Dtest=MultiTableTransactionITTest#<方法名>`。Surefire 的 `forkedProcessTimeoutInSeconds` 在 3.2.x 上**不可靠**（[SUREFIRE-1722](https://issues.apache.org/jira/browse/SUREFIRE-1722)），请用 GNU **`timeout 60s mvn ...`** 包住 `mvn test`（仅测试阶段，SDK `install` 可放在 `timeout` 外）。详见 [AGENT.md](../AGENT.md) §3.1。
+
 ### 3.3 Stream Load SDK 测试
 
 ```bash
@@ -200,6 +223,7 @@ PASSWORD = "";
 | IT 启动超时 | 检查 Docker 是否运行、镜像拉取是否正常；可尝试 `-Dit.starrocks.image=starrocks/allin1-ubuntu:3.5.5` |
 | Docker 需 sudo | 使用 `sudo -E mvn test ...` 以 root 访问 Docker socket；或配置 `SR_HTTP_URLS`/`SR_JDBC_URLS` 使用 TSP 外部集群 |
 | IT 连接失败 | 设置 `SR_HTTP_URLS` 和 `SR_JDBC_URLS` 指向 TSP 申请集群，修改默认配置避免连接 127.0.0.1 |
+| Kafka IT / `Could not find a valid Docker environment` | `KafkaToStarRocksITTest` 需 Testcontainers 访问 Docker；在 `docker run maven` 且**未**挂载 `/var/run/docker.sock` 时会失败。改用 §3.2.1「非 multi-table（不含 Kafka）」套件，或在宿主机跑 Maven / 挂载 Docker socket（见 [AGENT.md](../AGENT.md) §3.3） |
 | JMockit 报错 | 确认 `maven-surefire-plugin` 的 `argLine` 中包含 `-javaagent:.../jmockit-*.jar` |
 | SDK 依赖缺失 | 先执行 `cd starrocks-stream-load-sdk && mvn clean install` |
 | 端口冲突 | Sink 相关单测会绑定动态端口；IT 使用固定端口 8030、9030、8040 等，避免本机其他服务占用 |
@@ -308,16 +332,17 @@ $REMOTE_SSH "sudo docker run --rm \
 
 ---
 
-## 8. 如何更新本技能文档
+## 8. 如何更新本技能文档与 AGENT.md
 
-当发现新的运行或测试技巧时，按以下方式更新本文件：
+当发现新的运行或测试技巧时，按以下方式更新：
 
 1. **按模块归类**：将内容放入对应分区（构建、单元测试、集成测试、环境配置等）。
 2. **补充可执行命令**：给出可直接复制的 `mvn` / `build.sh` 命令。
 3. **记录系统属性 / 环境变量**：新增的 `-D` 或 `env` 放在「环境与“开关”配置」相关小节。
 4. **维护常见问题表**：在「常见问题与快速排查」中增加新情况与解决办法。
-5. **简短提交信息**：提交时使用类似 `docs: update Cloud Agents skill with [具体内容]` 的说明。
+5. **与 [AGENT.md](../AGENT.md) 同步**：集成测试分套件、SSH/Docker 模板、嵌套 Docker 限制等变更时，**同时**更新根目录 `AGENT.md` 与本文件对应小节，避免 Agent 入口与长文档漂移。
+6. **简短提交信息**：提交时使用类似 `docs: update Cloud Agents skill and AGENT.md with [具体内容]` 的说明。
 
 ---
 
-*最后更新：基于当前代码库结构整理*
+*最后更新：与仓库根目录 AGENT.md 配套；集成测试分套件见 §3.2.1*
