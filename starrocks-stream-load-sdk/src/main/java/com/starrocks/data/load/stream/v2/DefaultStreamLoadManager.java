@@ -1021,8 +1021,10 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             }
         }
 
+        boolean actuallyCommitted = false;
         if (anyTable != null && txnCoordinator.hasDataLoaded()) {
             txnCoordinator.prepareAndCommit(anyTable);
+            actuallyCommitted = true;
             LOG.info("[MultiTxn] Recycled shared transaction committed");
         } else {
             txnCoordinator.reset();
@@ -1036,7 +1038,14 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         if (partitionTracker != null) {
             partitionTracker.reset();
         }
-        lastCommitTimeMs = System.currentTimeMillis();
+        // Only advance lastCommitTimeMs on a real commit. A rollback-empty
+        // recycle (no data was ever loaded) is not a commit, and we must not
+        // delay the next commit-interval countdown by pretending one happened.
+        // Otherwise a burst of data immediately after an idle recycle would
+        // have to wait an extra commitInterval before becoming visible.
+        if (actuallyCommitted) {
+            lastCommitTimeMs = System.currentTimeMillis();
+        }
         ensureSharedTransaction();
     }
 
