@@ -438,11 +438,17 @@ public class TransactionTableRegion implements TableRegion {
      * @return {@code true} if a switch was performed, {@code false} otherwise
      */
     public boolean tryForceCleanSwitch() {
-        // Fast path checks without acquiring the lock
+        // Fast path checks without acquiring the lock.
+        // Note: cacheRows covers both activeChunk and inactiveChunks, so it is
+        // a coarser filter than we need here. Check activeChunk.numRows()
+        // directly so a region whose inactiveChunks still have pending data but
+        // whose activeChunk is empty doesn't force us to acquire the lock just
+        // to bail out inside it.
         if (!activeChunkCleanBoundary) {
             return false;
         }
-        if (cacheRows.get() == 0) {
+        Chunk snapshot = activeChunk;  // volatile load
+        if (snapshot == null || snapshot.numRows() == 0) {
             return false;
         }
         long now = System.currentTimeMillis();

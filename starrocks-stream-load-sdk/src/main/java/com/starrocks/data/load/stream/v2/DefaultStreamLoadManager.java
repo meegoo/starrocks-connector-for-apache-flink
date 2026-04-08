@@ -114,6 +114,16 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     private final AtomicBoolean commitInFlight = new AtomicBoolean(false);
 
     /**
+     * Commit interval (ms) cached from {@code properties.getExpectDelayTime()}
+     * at construction time. Read on every manager scan via
+     * {@link #shouldTriggerCommit()}, so we cache it to avoid repeated property
+     * lookups (and to make the contract immutable — the interval is a fixed
+     * value for the lifetime of a manager instance). Only meaningful in
+     * multi-table transaction mode.
+     */
+    private long commitIntervalMs;
+
+    /**
      * Minimum interval (ms) between two {@code switchChunkForCommit} calls on the
      * same region in multi-table mode. Computed as
      * {@code min(1000, max(100, commitInterval/10))} — small enough to batch
@@ -195,13 +205,15 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // cache-full flush threshold stays aligned with the manager's
         // write-block threshold. See review comment P1 on PR #487.
         this.flushAndCommitStrategy = new FlushAndCommitStrategy(properties, enableAutoCommit, this.maxCacheBytes);
-        // Compute miniSwitchIntervalMs for multi-table mode: capped between
-        // 100 ms and 1000 ms, targeting commitInterval / 10 as a sensible
-        // default so that a 1 s commit interval yields 100 ms batching and
-        // a 30 s commit interval caps at 1 s batching.
-        long commitIntervalMs = properties.getExpectDelayTime();
-        this.miniSwitchIntervalMs = Math.min(1000L, Math.max(100L, commitIntervalMs / 10L));
-        this.lastCommitTimeMs = System.currentTimeMillis();
+        // Cache commit interval and compute miniSwitchIntervalMs for multi-table
+        // mode. miniInterval is capped between 100 ms and 1000 ms, targeting
+        // commitInterval / 10 as a sensible default so that a 1 s commit interval
+        // yields 100 ms batching and a 30 s commit interval caps at 1 s batching.
+        // lastCommitTimeMs is initialized in init() (right before the manager
+        // thread starts), so it reflects the start of the scan loop rather than
+        // construction time.
+        this.commitIntervalMs = properties.getExpectDelayTime();
+        this.miniSwitchIntervalMs = Math.min(1000L, Math.max(100L, this.commitIntervalMs / 10L));
         // get timeout from properties's header
         String timeoutStr = properties.getHeaders().get("timeout");
         if (timeoutStr != null) {
@@ -345,6 +357,14 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                         LOG.info("[MultiTxn] No data loaded; rolling back empty txn during savepoint");
                                         txnCoordinator.reset();
                                     }
+                                    // Keep lastCommitTimeMs in sync with actual commit
+                                    // activity so the next shouldTriggerCommit() check on
+                                    // the normal path starts its countdown from the
+                                    // savepoint commit, not from the previous regular
+                                    // commit. This is cosmetic (downstream hasDataLoaded
+                                    // / hasInactiveChunks checks prevent spurious commits),
+                                    // but keeps the time accounting accurate.
+                                    lastCommitTimeMs = System.currentTimeMillis();
                                     allRegionsCommitted = true;
                                 } catch (Exception ex) {
                                     LOG.error("[MultiTxn] Failed to commit shared transaction during savepoint", ex);
@@ -451,7 +471,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                         // interval has elapsed AND there is data to commit.
                         if (multiTableTransactionEnabled && partitionTracker != null) {
                             managerForceSwitchCleanBoundaryRegions();
-                            trySwitchAndCommit();
+                            tryStartTimerDrivenCommit();
                             if (commitInFlight.get()) {
                                 // Commit interval elapsed with data available; skip
                                 // autonomous flush and enter processMultiTableCommit()
@@ -540,13 +560,17 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         // open a window where a write and a manager-thread force-switch could
         // race, potentially freezing partial transaction data.
         List<TransactionTableRegion> pRegions = partitionRegions.get(partition);
+        int regionCount = pRegions == null ? 0 : pRegions.size();
         if (pRegions != null) {
             for (TransactionTableRegion region : pRegions) {
                 region.tryMiniIntervalSwitch();
             }
         }
         partitionTracker.onTxnEnd(partition);
-        LOG.debug("[MultiTxn] txnEnd recorded for partition={}", partition);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("[MultiTxn] txnEnd recorded for partition={}, regions={}, miniInterval={}ms",
+                    partition, regionCount, miniSwitchIntervalMs);
+        }
     }
 
     /**
@@ -590,7 +614,7 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         if (commitInFlight.get()) {
             return false;
         }
-        if (System.currentTimeMillis() - lastCommitTimeMs < properties.getExpectDelayTime()) {
+        if (System.currentTimeMillis() - lastCommitTimeMs < commitIntervalMs) {
             return false;
         }
         if (txnCoordinator != null && txnCoordinator.hasDataLoaded()) {
@@ -605,13 +629,17 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
     }
 
     /**
-     * Attempts to trigger a time-driven commit. Called on the manager thread
+     * Attempts to start a time-driven commit cycle. Called on the manager thread
      * from the normal scan path. Does NOT do any per-region switching — that is
      * handled by (a) the task thread's {@code tryMiniIntervalSwitch} on each
      * txnEnd and (b) {@link #managerForceSwitchCleanBoundaryRegions()} for the
      * source-idle fallback.
+     *
+     * <p>Sets {@code commitInFlight=true} if {@link #shouldTriggerCommit()}
+     * returns true; the main loop will then enter {@code processMultiTableCommit()}
+     * on the next iteration to drive the actual commit protocol.
      */
-    private void trySwitchAndCommit() {
+    private void tryStartTimerDrivenCommit() {
         if (shouldTriggerCommit() && commitInFlight.compareAndSet(false, true)) {
             commitInFlightStartMs = System.currentTimeMillis();
             // No flushable.signal() needed — this method already runs on the
@@ -623,17 +651,24 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
 
     /**
      * Processes a multi-table commit cycle using the SharedTransactionCoordinator.
-     * Called on the manager thread when commitInFlight=true.
+     * Called on the manager thread when {@code commitInFlight=true}.
      *
-     * <p>Because the shared transaction is eagerly opened (by {@link #ensureSharedTransaction()})
-     * before any autonomous flush, all in-flight HTTP loads already use the shared label.
-     * This method simply:
+     * <p>Because the shared transaction is eagerly opened (by
+     * {@link #ensureSharedTransaction()}) before any autonomous flush, all
+     * in-flight HTTP loads already use the shared label. This method simply:
      * <ol>
-     *   <li>Waits for all in-flight loads to complete</li>
-     *   <li>Triggers loads for any remaining inactive chunks (from switchChunkForCommit)</li>
-     *   <li>Waits again for those loads</li>
-     *   <li>Executes unified prepare + commit</li>
-     *   <li>Opens a new shared transaction for the next cycle</li>
+     *   <li>Waits for any in-flight loads to complete (defers to the next scan
+     *       cycle if any region is still FLUSHING/retrying)</li>
+     *   <li>Triggers loads for any remaining inactive chunks — those produced by
+     *       {@code switchChunkForCommit} or the manager-thread clean-boundary
+     *       fallback that were not yet drained by autonomous flush</li>
+     *   <li>On the next scan cycle, once those triggered loads complete,
+     *       executes a unified commit via the coordinator (multi-table
+     *       transactions skip the prepare step, which StarRocks does not
+     *       support in multi-table mode)</li>
+     *   <li>Resets state ({@code commitInFlight}, {@code partitionTracker},
+     *       region labels, {@code lastCommitTimeMs}) and opens a new shared
+     *       transaction for the next cycle</li>
      * </ol>
      */
     private void processMultiTableCommit() {
@@ -913,10 +948,30 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             return;
         }
 
-        // All regions are at clean boundaries. Any activeChunk data belongs to
-        // completed source transactions and is safe to freeze for commit.
+        // All regions were observed clean in the pre-check above. Now freeze
+        // their activeChunks atomically using tryForceCleanSwitch(), which
+        // re-checks cleanBoundary under the writeLock. This closes a race
+        // window: between the unlocked pre-check and the actual switch, the
+        // task thread could call write() on a region and flip its
+        // cleanBoundary to false. Using switchChunkForCommit() here would
+        // unconditionally freeze that now-dirty activeChunk (containing an
+        // in-progress source transaction), violating the safety invariant.
+        //
+        // If tryForceCleanSwitch() returns false for a region, one of:
+        //   (a) a concurrent write raced and made the region dirty — its
+        //       data stays in activeChunk and will be committed in a future
+        //       cycle (under the new shared label opened after this recycle);
+        //   (b) activeChunk was already empty — nothing to do;
+        //   (c) miniInterval has not yet elapsed — cannot happen here because
+        //       recycle fires only after sharedTxnMaxIdleMs which is far
+        //       larger than any miniInterval.
+        // In all three cases, skipping the region is safe.
         for (TransactionTableRegion region : flushQ) {
-            region.switchChunkForCommit();
+            boolean switched = region.tryForceCleanSwitch();
+            if (!switched && !region.isActiveChunkCleanBoundary()) {
+                LOG.warn("[MultiTxn] Recycle: region {} became dirty between pre-check and switch; " +
+                        "its data will be committed in a future cycle", region.getUniqueKey());
+            }
         }
         // Drain any newly-frozen inactive chunks into the shared transaction
         // before committing. We wait synchronously for each region's load to

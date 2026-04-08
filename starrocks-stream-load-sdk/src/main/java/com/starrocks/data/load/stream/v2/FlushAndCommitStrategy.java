@@ -97,8 +97,8 @@ public class FlushAndCommitStrategy implements StreamLoadStrategy {
             for (TransactionTableRegion region : regions) {
                 if (region.hasInactiveChunks()) {
                     numTableTriggerFlush.getAndIncrement();
-                    flushRegions.add(new SelectFlushResult(FlushReason.BUFFER_ROWS_REACH_LIMIT, region));
-                    LOG.debug("[MultiTxn] Choose region {} to flush inactive chunks",
+                    flushRegions.add(new SelectFlushResult(FlushReason.INACTIVE_DRAIN, region));
+                    LOG.debug("[MultiTxn] Choose region {} to drain inactive chunks",
                             region.getUniqueKey());
                 }
             }
