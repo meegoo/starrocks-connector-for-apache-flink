@@ -528,11 +528,17 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
         //   together with previously-completed source transactions, amortizing
         //   the HTTP-load overhead across multiple txns (N:1 mapping).
         //
-        // The switch must happen on the task thread (not deferred to the manager
-        // thread) because the very next record from the source may belong to a
-        // new source transaction. Any switch after that record arrives would
-        // freeze a chunk containing data from the new (in-progress) transaction,
-        // which would break cross-transaction atomicity on commit.
+        // Both the cleanBoundary mark and the conditional switch MUST run on
+        // the task thread (not deferred to the manager thread) because the task
+        // thread is the sole serializer of write() and setCommitAllowed()
+        // events. Marking cleanBoundary=true here guarantees that the flag
+        // reflects the MOST RECENT task-thread event: if the next event is
+        // another write, write0() will flip it back to false before the manager
+        // thread's scan observes it, preserving the invariant that
+        // "cleanBoundary=true" means "activeChunk contains only data from
+        // completed source transactions". Deferring to the manager thread would
+        // open a window where a write and a manager-thread force-switch could
+        // race, potentially freezing partial transaction data.
         List<TransactionTableRegion> pRegions = partitionRegions.get(partition);
         if (pRegions != null) {
             for (TransactionTableRegion region : pRegions) {
@@ -920,8 +926,35 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                 txnCoordinator.markDataLoaded();
             }
         }
+        // Wait for in-flight loads with a bounded timeout. This point is
+        // reached only after sharedTxnMaxIdleMs has elapsed, so we are already
+        // operating on a timeout budget; an unbounded wait could deadlock the
+        // manager thread if a load hangs (e.g., network stall or a region stuck
+        // in a long retry loop). Cap the total wait at flushTimeoutMs and fail
+        // fast on timeout so Flink can restart the job from the last checkpoint.
+        long recycleWaitStartMs = System.currentTimeMillis();
         for (TransactionTableRegion region : flushQ) {
             while (region.isFlushing() || region.isRetrying()) {
+                if (System.currentTimeMillis() - recycleWaitStartMs > flushTimeoutMs) {
+                    LOG.error("[MultiTxn] Recycle wait timeout ({}ms) for region {}, " +
+                            "failing fast. label={}",
+                            flushTimeoutMs, region.getUniqueKey(),
+                            txnCoordinator.getSharedLabel());
+                    txnCoordinator.reset();
+                    for (TransactionTableRegion r : flushQ) {
+                        if (!r.isRetrying()) {
+                            r.setLabel(null);
+                        }
+                    }
+                    commitInFlight.set(false);
+                    if (partitionTracker != null) {
+                        partitionTracker.reset();
+                    }
+                    this.e = new StreamLoadFailException(
+                            "[MultiTxn] Recycle wait timeout: region " + region.getUniqueKey() +
+                            " did not complete its in-flight load within " + flushTimeoutMs + "ms");
+                    return;
+                }
                 LockSupport.parkNanos(1_000_000L);
             }
         }
