@@ -88,6 +88,21 @@ public class TransactionTableRegion implements TableRegion {
     // Multi-table transaction mode flag
     private final boolean multiTableTransactionEnabled;
 
+    // Hard upper bound (bytes) for activeChunk while an in-progress source
+    // transaction is being accumulated. Only meaningful in multi-table mode.
+    //
+    // Multi-table mode deliberately disables size/row-based chunk switching
+    // (see write0) to keep a source transaction atomic under the shared
+    // label, which means activeChunk cannot be drained until the next txnEnd
+    // arrives. If a single region's activeChunk grows past the task thread's
+    // blockIfCacheFull hard threshold (maxWriteBlockCacheBytes), deadlock is
+    // inevitable because the manager has no inactiveChunks to flush. Fail
+    // fast when this threshold is exceeded so the user gets a clear error
+    // instead of a silent hang.
+    //
+    // A value of 0 disables the check (used by the legacy constructor).
+    private final long multiTableSingleTxnMaxBytes;
+
     // Minimum interval (ms) between two switchChunkForCommit calls on this region.
     // Only meaningful when multiTableTransactionEnabled. Used to batch multiple
     // source transactions into a single inactive chunk, reducing HTTP request
@@ -119,7 +134,7 @@ public class TransactionTableRegion implements TableRegion {
                             int maxRetries,
                             int retryIntervalInMs) {
         this(uniqueKey, database, table, manager, properties, streamLoader,
-                labelGenerator, maxRetries, retryIntervalInMs, false, 0L);
+                labelGenerator, maxRetries, retryIntervalInMs, false, 0L, 0L);
     }
 
     public TransactionTableRegion(String uniqueKey,
@@ -132,7 +147,8 @@ public class TransactionTableRegion implements TableRegion {
                             int maxRetries,
                             int retryIntervalInMs,
                             boolean multiTableTransactionEnabled,
-                            long miniSwitchIntervalMs) {
+                            long miniSwitchIntervalMs,
+                            long multiTableSingleTxnMaxBytes) {
         this.uniqueKey = uniqueKey;
         this.database = database;
         this.table = table;
@@ -152,6 +168,7 @@ public class TransactionTableRegion implements TableRegion {
         this.retryIntervalInMs = retryIntervalInMs;
         this.multiTableTransactionEnabled = multiTableTransactionEnabled;
         this.miniSwitchIntervalMs = miniSwitchIntervalMs;
+        this.multiTableSingleTxnMaxBytes = multiTableSingleTxnMaxBytes;
     }
 
     private void initHeaders(StreamLoadTableProperties properties) {
@@ -510,13 +527,33 @@ public class TransactionTableRegion implements TableRegion {
                     || activeChunk.numRows() >= properties.getMaxBufferRows()) {
                 switchChunk();
             }
+        } else if (multiTableSingleTxnMaxBytes > 0
+                && activeChunk.estimateChunkSize(row) > multiTableSingleTxnMaxBytes) {
+            // Multi-table mode fail-fast: activeChunk cannot be switched until
+            // the next txnEnd arrives (see comment below), so if a single
+            // in-progress source transaction alone exceeds the task thread's
+            // write-block threshold, blockIfCacheFull will stall the task thread
+            // while the manager has no inactiveChunks to drain — a silent
+            // deadlock. Surface a clear error so the user can either lower
+            // source-transaction granularity or increase
+            // sink.transaction.multi-table.buffer-size.
+            throw new IllegalStateException(
+                    "In-progress source transaction for db=" + database + ", table=" + table
+                            + " exceeded the multi-table transaction write-block threshold ("
+                            + multiTableSingleTxnMaxBytes + " bytes). Multi-table mode cannot "
+                            + "switch activeChunk mid-transaction, so a single source transaction "
+                            + "must fit within 2 * sink.transaction.multi-table.buffer-size. "
+                            + "Reduce the source transaction size or increase the buffer size.");
         }
         // Multi-table mode: do NOT switch mid-transaction. A switch at this point
         // would move partial source-transaction data into inactiveChunks, which
         // the manager's commit path may then load under the shared label before
         // the source transaction has reached its txnEnd. Instead, activeChunk
         // grows until the next setCommitAllowed (txnEnd) triggers a clean switch.
-        // Memory is bounded by blockIfCacheFull via maxWriteBlockCacheBytes.
+        // A single source transaction that would exceed the write-block
+        // threshold is rejected above to avoid a blockIfCacheFull deadlock,
+        // since the manager can only flush inactiveChunks and none exist
+        // before txnEnd.
 
         activeChunk.addRow(row);
         cacheBytes.addAndGet(row.length);
