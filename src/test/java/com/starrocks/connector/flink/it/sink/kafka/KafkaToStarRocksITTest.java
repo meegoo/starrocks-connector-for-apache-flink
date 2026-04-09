@@ -128,8 +128,8 @@ public class KafkaToStarRocksITTest extends KafkaTableTestBase {
         propertiesMap.put("load-url", getSrHttpUrls());
         propertiesMap.put("database-name", SR_DB_NAME);
         propertiesMap.put("table-name", tableName);
-        propertiesMap.put("username", "root");
-        propertiesMap.put("password", "");
+        propertiesMap.put("username", SR_USERNAME);
+        propertiesMap.put("password", SR_PASSWORD);
         propertiesMap.put("sink.buffer-flush.interval-ms", "1000");
         propertiesMap.putAll(customProperties);
         StringJoiner joiner = new StringJoiner(",");

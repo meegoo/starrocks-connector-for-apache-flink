@@ -79,6 +79,24 @@ public abstract class KafkaTableTestBase extends AbstractTestBase {
     protected static String SR_DB_NAME;
     protected static String SR_HTTP_URLS = "127.0.0.1:8030";
     protected static String SR_JDBC_URLS = "jdbc:mysql://127.0.0.1:9030";
+    protected static String SR_USERNAME = "root";
+    protected static String SR_PASSWORD = "";
+
+    /**
+     * Same resolution as {@link com.starrocks.connector.flink.it.StarRocksITTestBase}: JVM props,
+     * then env, so Kafka→StarRocks ITs use the TSP cluster when {@code -Dit.starrocks.fe.*} is set.
+     */
+    private static String resolveFeConfig(String propKey, String envKey, String defaultValue) {
+        String v = System.getProperty(propKey);
+        if (v != null && !v.isEmpty()) {
+            return v;
+        }
+        v = System.getenv(envKey);
+        if (v != null && !v.isEmpty()) {
+            return v;
+        }
+        return defaultValue;
+    }
 
     protected static String getSrHttpUrls() {
         return SR_HTTP_URLS;
@@ -117,16 +135,43 @@ public abstract class KafkaTableTestBase extends AbstractTestBase {
     @BeforeClass
     public static void setUp() throws Exception {
         if (!DEBUG_MODE) {
-            StarRocksTestEnvironment env = StarRocksTestEnvironment.getInstance();
-            env.startIfNeeded();
-            SR_HTTP_URLS = env.getHttpAddress();
-            SR_JDBC_URLS = env.getJdbcUrl();
+            String extHttp = resolveFeConfig("it.starrocks.fe.http", "SR_HTTP_URLS", null);
+            String extJdbc = resolveFeConfig("it.starrocks.fe.jdbc", "SR_JDBC_URLS", null);
+            if (extHttp != null && extJdbc != null) {
+                SR_HTTP_URLS = extHttp;
+                SR_JDBC_URLS = extJdbc;
+                SR_USERNAME = resolveFeConfig("it.starrocks.username", "SR_USERNAME", "root");
+                SR_PASSWORD = resolveFeConfig("it.starrocks.password", "SR_PASSWORD", "");
+                LOG.info("Using external StarRocks for Kafka IT: http={}, jdbc={}", SR_HTTP_URLS, SR_JDBC_URLS);
+            } else {
+                try {
+                    StarRocksTestEnvironment env = StarRocksTestEnvironment.getInstance();
+                    env.startIfNeeded();
+                    String h = env.getHttpAddress();
+                    String j = env.getJdbcUrl();
+                    if (h != null && j != null) {
+                        SR_HTTP_URLS = h;
+                        SR_JDBC_URLS = j;
+                        SR_USERNAME = env.getUsername();
+                        SR_PASSWORD = env.getPassword();
+                        LOG.info("Using StarRocks Testcontainer for Kafka IT: http={}, jdbc={}", SR_HTTP_URLS, SR_JDBC_URLS);
+                    } else {
+                        LOG.warn(
+                                "StarRocks Testcontainer did not expose addresses. "
+                                        + "Set -Dit.starrocks.fe.http / -Dit.starrocks.fe.jdbc or SR_HTTP_URLS / SR_JDBC_URLS.");
+                    }
+                } catch (Throwable t) {
+                    LOG.warn("Failed to start StarRocks container for Kafka IT.", t);
+                }
+            }
         }
-        assertTrue(SR_HTTP_URLS != null && SR_JDBC_URLS != null);
+        assertTrue(
+                "SR_HTTP_URLS and SR_JDBC_URLS must be set (external FE or Testcontainer).",
+                SR_HTTP_URLS != null && !SR_HTTP_URLS.isEmpty() && SR_JDBC_URLS != null && !SR_JDBC_URLS.isEmpty());
 
         SR_DB_NAME = "sr_sink_test_" + genRandomUuid();
         try {
-            SR_DB_CONNECTION = DriverManager.getConnection(getSrJdbcUrl(), "root", "");
+            SR_DB_CONNECTION = DriverManager.getConnection(getSrJdbcUrl(), SR_USERNAME, SR_PASSWORD);
             LOG.info("Success to create db connection via jdbc {}", getSrJdbcUrl());
         } catch (Exception e) {
             LOG.error("Failed to create db connection via jdbc {}", getSrJdbcUrl(), e);
