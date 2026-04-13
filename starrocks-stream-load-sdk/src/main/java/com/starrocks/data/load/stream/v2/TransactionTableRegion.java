@@ -641,7 +641,7 @@ public class TransactionTableRegion implements TableRegion {
             //     mid-transaction, so blockIfCacheFull would stall the task
             //     thread while the manager has no inactiveChunks to drain —
             //     a silent deadlock. Surface a clear error instead.
-            if (activeChunk.estimateChunkSize(row) > multiTableSingleTxnMaxBytes) {
+            if (activeChunk.estimateChunkSize(row) >= multiTableSingleTxnMaxBytes) {
                 throw new IllegalStateException(
                         "In-progress source transaction for db=" + database + ", table=" + table
                                 + " exceeded the multi-table transaction write-block threshold ("
@@ -662,7 +662,7 @@ public class TransactionTableRegion implements TableRegion {
             if (aggregateTracker != null) {
                 long projected = aggregateTracker.getAggregateInProgressTxnBytes() + row.length;
                 long writeBlockLimit = aggregateTracker.getMaxWriteBlockCacheBytes();
-                if (projected > writeBlockLimit) {
+                if (projected >= writeBlockLimit) {
                     throw new IllegalStateException(
                             "Aggregate in-progress source-transaction bytes across all tables ("
                                     + projected + " bytes) would exceed the multi-table write-block "
