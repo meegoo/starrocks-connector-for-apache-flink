@@ -1353,4 +1353,92 @@ public class StreamLoadManagerMultiTableTest {
             manager.close();
         }
     }
+
+    /**
+     * Verifies the aggregate fail-fast guard across multiple regions within a
+     * single source transaction.
+     *
+     * <p>The per-region {@code multiTableSingleTxnMaxBytes} check in
+     * {@code TransactionTableRegion.write0} only sees one region's activeChunk
+     * at a time. A single source transaction that splits its payload across
+     * several tables can keep each region's chunk comfortably under the
+     * per-region hard cap while the combined payload pushes the manager-level
+     * {@code currentCacheBytes} past {@code maxWriteBlockCacheBytes}. At that
+     * point the task thread would be parked in {@code blockIfCacheFull} with
+     * no region at a clean boundary, and the txnEnd marker needed to unblock
+     * any region can never be delivered — a silent deadlock.
+     *
+     * <p>This test writes rows alternately to three tables without calling
+     * {@code setCommitAllowed}, simulating one source transaction that spans
+     * all three. No single region exceeds the per-region cap; the deadlock
+     * is only avoidable via the aggregate in-progress byte guard in the
+     * manager. We expect an {@link IllegalStateException} with a clear
+     * "aggregate" remediation hint, raised before {@code blockIfCacheFull}
+     * could park the task thread.
+     */
+    @Test(timeout = 10000)
+    public void testFailFastOnAggregateInProgressBytesAcrossRegions() throws Exception {
+        // 1 KB buffer → hard cap (maxWriteBlockCacheBytes) = 2 KB.
+        // Per-region fail-fast threshold is also 2 KB, so each individual
+        // region can grow almost to 2 KB without tripping the per-region
+        // check. Spreading writes across three tables keeps each region well
+        // under that limit while the aggregate grows past 2 KB.
+        StreamLoadProperties properties = buildMultiTableProperties(60000, 1024L);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            IllegalStateException caught = null;
+            int rowsWritten = 0;
+            String[] tables = {"orders", "items", "customers"};
+            try {
+                // Round-robin across three tables on one partition without any
+                // setCommitAllowed call. Each row is ~68 bytes; each region's
+                // activeChunk grows by one row per three iterations, so after
+                // ~90 iterations each region holds ~30 rows (~2 KB each, well
+                // under the per-region 2 KB cap when viewed individually) but
+                // the aggregate is ~6 KB (3× hard cap). The aggregate guard
+                // should fire long before any region approaches its own cap.
+                for (int i = 0; i < 300; i++) {
+                    String table = tables[i % tables.length];
+                    manager.write(0, "test", table,
+                            String.format(
+                                    "{\"id\":%06d,\"customer_id\":%06d,\"notes\":\"pad-block-%04d\"}",
+                                    i, i, i));
+                    rowsWritten++;
+                }
+                Assert.fail("Expected IllegalStateException for aggregate in-progress overflow, "
+                        + "but write() succeeded after " + rowsWritten + " rows");
+            } catch (IllegalStateException e) {
+                caught = e;
+            }
+
+            Assert.assertNotNull(
+                    "Expected IllegalStateException for aggregate in-progress overflow", caught);
+            Assert.assertTrue(
+                    "Error message should identify it as the aggregate guard: " + caught.getMessage(),
+                    caught.getMessage().toLowerCase().contains("aggregate"));
+            Assert.assertTrue(
+                    "Error message should mention the write-block threshold: " + caught.getMessage(),
+                    caught.getMessage().contains("write-block"));
+            Assert.assertTrue(
+                    "Error message should suggest a remediation: " + caught.getMessage(),
+                    caught.getMessage().contains("buffer-size")
+                            || caught.getMessage().contains("buffer size"));
+            // Sanity: the aggregate guard must fire before blockIfCacheFull
+            // parks the task thread. currentCacheBytes crosses the 2 KB hard
+            // cap at ~30 rows (30 × 68 ≈ 2040 B), so the guard should fire
+            // near that point, not after hundreds of rows.
+            Assert.assertTrue(
+                    "Aggregate guard should trigger near the hard-cap boundary, "
+                            + "but rowsWritten=" + rowsWritten,
+                    rowsWritten < 60);
+        } finally {
+            try {
+                manager.close();
+            } catch (Exception ignore) {
+                // close() after an exception is best-effort.
+            }
+        }
+    }
 }
