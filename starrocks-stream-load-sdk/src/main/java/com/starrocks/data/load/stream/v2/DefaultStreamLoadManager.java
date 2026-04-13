@@ -1372,13 +1372,19 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                     LOG.warn("Failed to rollback shared transaction during close", ex);
                 }
             }
-            manager.interrupt();
-            streamLoader.close();
-            // Defensive: drop any residual in-progress byte accounting so a
-            // later reuse of this instance (or a snapshot taken post-close)
-            // cannot observe a stale non-zero aggregate that would produce
-            // false-positive fail-fasts in write0's aggregate guard.
-            aggregateInProgressTxnBytes.set(0L);
+            try {
+                manager.interrupt();
+                streamLoader.close();
+            } finally {
+                // Defensive: drop any residual in-progress byte accounting so a
+                // later reuse of this instance (or a snapshot taken post-close)
+                // cannot observe a stale non-zero aggregate that would produce
+                // false-positive fail-fasts in write0's aggregate guard. The
+                // reset must run even if streamLoader.close() throws — otherwise
+                // the "defensive" framing in the comment above would only hold
+                // on the happy path.
+                aggregateInProgressTxnBytes.set(0L);
+            }
         }
     }
 
