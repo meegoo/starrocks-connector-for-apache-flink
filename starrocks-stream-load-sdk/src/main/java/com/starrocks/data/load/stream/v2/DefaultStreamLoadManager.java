@@ -1374,6 +1374,11 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
             }
             manager.interrupt();
             streamLoader.close();
+            // Defensive: drop any residual in-progress byte accounting so a
+            // later reuse of this instance (or a snapshot taken post-close)
+            // cannot observe a stale non-zero aggregate that would produce
+            // false-positive fail-fasts in write0's aggregate guard.
+            aggregateInProgressTxnBytes.set(0L);
         }
     }
 

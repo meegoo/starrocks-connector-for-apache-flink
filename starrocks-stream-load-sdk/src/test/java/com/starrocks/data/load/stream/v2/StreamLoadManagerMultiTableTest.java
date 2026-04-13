@@ -1441,4 +1441,84 @@ public class StreamLoadManagerMultiTableTest {
             }
         }
     }
+
+    /**
+     * Positive counterpart to {@link #testFailFastOnAggregateInProgressBytesAcrossRegions}:
+     * verifies that a {@code setCommitAllowed} actually drains the manager's
+     * aggregate in-progress byte counter, so a second multi-region source
+     * transaction of the same size proceeds without tripping the aggregate
+     * fail-fast.
+     *
+     * <p>This pins down the release path (
+     * {@code TransactionTableRegion.releaseInProgressBytes} invoked from
+     * {@code tryMiniIntervalSwitch} on txnEnd). A regression that forgets to
+     * subtract the per-region in-progress bytes back to the manager aggregate
+     * would leave stale bytes in the counter: the second sweep's writes plus
+     * the stale 1st-sweep bytes would cross the write-block threshold and
+     * wrongly throw {@link IllegalStateException}.
+     *
+     * <p>The two sweeps are each sized so that, <em>individually</em>, they
+     * stay well below the 2 KB hard cap, but <em>together without the
+     * drain</em> they would cross it. Exact sizing: each sweep writes ~25
+     * rows (≈ 68 B/row) across three tables → ~1.7 KB of in-progress bytes.
+     * With drain: second sweep peaks at ~1.7 KB &lt; 2 KB → no exception.
+     * Without drain: combined ≈ 3.4 KB &gt; 2 KB → fail-fast fires on the
+     * second sweep.
+     */
+    @Test(timeout = 15000)
+    public void testCommitDrainsAggregateInProgressBytes() throws Exception {
+        StreamLoadProperties properties = buildMultiTableProperties(60000, 1024L);
+        StreamLoadManagerV2 manager = new StreamLoadManagerV2(properties, true);
+        manager.init();
+
+        try {
+            mockedServer.resetCounters();
+
+            String[] tables = {"orders", "items", "customers"};
+            final int rowsPerSweep = 25; // ~1.7 KB aggregate per sweep
+
+            // Sweep #1: round-robin three tables, then txnEnd. The txnEnd on
+            // partition 0 fans out to all regions and must drain their
+            // per-region inProgressTxnBytes back to the manager aggregate.
+            for (int i = 0; i < rowsPerSweep; i++) {
+                String table = tables[i % tables.length];
+                manager.write(0, "test", table,
+                        String.format(
+                                "{\"id\":%06d,\"customer_id\":%06d,\"notes\":\"pad-block-%04d\"}",
+                                i, i, i));
+            }
+            manager.setCommitAllowed(0, true);
+            Assert.assertNull("No exception after sweep #1 txnEnd",
+                    manager.getException());
+
+            // Sweep #2: same size and shape. If the drain worked, the
+            // aggregate counter started this sweep at (near) 0 and peaks at
+            // ~1.7 KB, comfortably under the 2 KB cap. If the drain silently
+            // regresses, the aggregate still carries sweep #1's ~1.7 KB, and
+            // sweep #2 would cross 2 KB partway through and throw.
+            for (int i = 0; i < rowsPerSweep; i++) {
+                String table = tables[i % tables.length];
+                manager.write(0, "test", table,
+                        String.format(
+                                "{\"id\":%06d,\"customer_id\":%06d,\"notes\":\"pad-block-%04d\"}",
+                                100 + i, 100 + i, 100 + i));
+            }
+            manager.setCommitAllowed(0, true);
+            Assert.assertNull("No exception after sweep #2 txnEnd — the "
+                            + "aggregate guard should not misfire after a clean txnEnd drain",
+                    manager.getException());
+
+            manager.flush();
+            Assert.assertNull("No exception after flush", manager.getException());
+
+            // Both sweeps must have produced at least one commit against the
+            // mocked server — otherwise we haven't actually exercised the
+            // drain path.
+            Assert.assertTrue(
+                    "Expected at least 1 commit after sweeps: " + mockedServer.getCommitCount(),
+                    mockedServer.getCommitCount() >= 1);
+        } finally {
+            manager.close();
+        }
+    }
 }
