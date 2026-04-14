@@ -325,31 +325,58 @@ public class DefaultStreamLoadManager implements StreamLoadManager, Serializable
                                 }
                             }
 
+                            // Wait for all regions to quiesce (neither flushing nor
+                            // retrying) before opening the shared transaction. Without
+                            // this wait, ensureSharedTransaction() would return false on
+                            // any transient in-flight load and force the checkpoint to
+                            // fail — a common race under load. The check mirrors the
+                            // allLoadsDone loop below, extended with isRetrying() (so
+                            // we don't race trySetLabel() against a region currently
+                            // between retry attempts), and capped by flushTimeoutMs so
+                            // a non-converging retry cannot block the savepoint forever.
+                            long waitDeadline = System.currentTimeMillis() + flushTimeoutMs;
+                            while (true) {
+                                if (this.e != null) {
+                                    // Some callback failed the manager while we were
+                                    // waiting. Preserve the original root cause rather
+                                    // than letting ensureSharedTransaction() below throw
+                                    // a secondary exception that the outer catch would
+                                    // assign to this.e, masking the real error.
+                                    throw new IllegalStateException(
+                                            "[MultiTxn] Manager errored while waiting for "
+                                            + "regions to quiesce during savepoint", this.e);
+                                }
+                                boolean anyBusy = false;
+                                for (TransactionTableRegion region : flushQ) {
+                                    if (region.isFlushing() || region.isRetrying()) {
+                                        anyBusy = true;
+                                        break;
+                                    }
+                                }
+                                if (!anyBusy) {
+                                    break;
+                                }
+                                if (System.currentTimeMillis() > waitDeadline) {
+                                    throw new IllegalStateException(
+                                            "[MultiTxn] Savepoint timed out after " + flushTimeoutMs
+                                            + "ms waiting for regions to quiesce before opening "
+                                            + "shared transaction");
+                                }
+                                LockSupport.parkNanos(1_000_000L);
+                            }
+
                             // Ensure a shared transaction is open (may not be if no data
                             // was written yet, or if we just finished a commit cycle).
-                            // If ensureSharedTransaction() silently returns false (e.g. a
-                            // region is flushing/retrying), falling through would trigger
-                            // triggerLoadIfNeeded() with null labels and create orphan
-                            // independent transactions — breaking savepoint atomicity.
-                            // Fail the checkpoint so Flink retries from the last one.
+                            // After the quiesce wait above this will almost always
+                            // succeed; the throw covers the microsecond-window race
+                            // where trySetLabel() loses to a late-arriving retry.
                             if (!txnCoordinator.isActive() && !flushQ.isEmpty()) {
                                 if (!ensureSharedTransaction()) {
                                     throw new IllegalStateException(
-                                            "[MultiTxn] Could not open shared transaction during savepoint " +
-                                            "(a region is flushing/retrying or label injection lost a race). " +
-                                            "Failing the checkpoint to preserve atomicity; Flink will retry.");
-                                }
-                            }
-
-                            // Wait for any in-flight loads to complete
-                            for (TransactionTableRegion region : flushQ) {
-                                Future<?> result = region.getResult();
-                                if (result != null) {
-                                    try {
-                                        result.get();
-                                    } catch (Exception ignored) {
-                                        // errors will be handled by the callback
-                                    }
+                                            "[MultiTxn] Could not open shared transaction during "
+                                            + "savepoint even after quiesce wait (likely trySetLabel "
+                                            + "lost a race with a late retry). Failing the checkpoint "
+                                            + "to preserve atomicity; Flink will retry.");
                                 }
                             }
 
