@@ -858,11 +858,12 @@ public class TransactionTableRegion implements TableRegion {
                 LOG.error("Failed to flush data for db: {}, table: {} after {} times retry, the last exception is",
                         database, table, numRetries, e);
                 // Terminal failure: no further retry will re-drive the state
-                // machine back to ACTIVE via complete(). Release FLUSHING now
-                // so the manager's final drain / rollback paths observe a
-                // non-busy region. The manager will see this.e from
+                // machine back to ACTIVE via complete(). Release FLUSHING or
+                // COMMITTING now so the manager's final drain / rollback paths
+                // observe a non-busy region. The manager will see this.e from
                 // callback() below and stop scheduling new work.
                 state.compareAndSet(State.FLUSHING, State.ACTIVE);
+                state.compareAndSet(State.COMMITTING, State.ACTIVE);
                 manager.callback(firstException);
                 return;
             }
