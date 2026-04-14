@@ -834,7 +834,16 @@ public class TransactionTableRegion implements TableRegion {
             }
         } catch (Throwable e) {
             LOG.error("TransactionTableRegion commit failed, db: {}, table: {}, label: {}", database, table, label, e);
-            fail(e);
+            // Handle commit errors directly instead of routing through fail(),
+            // which is designed for the flush state machine. fail()'s retry
+            // path calls streamLoad() — wrong for a commit failure — and would
+            // leave the region stuck in COMMITTING. Commit failures are always
+            // terminal: release COMMITTING and propagate to the manager.
+            if (firstException == null) {
+                firstException = e;
+            }
+            state.compareAndSet(State.COMMITTING, State.ACTIVE);
+            manager.callback(firstException);
             return;
         }
 
@@ -858,12 +867,11 @@ public class TransactionTableRegion implements TableRegion {
                 LOG.error("Failed to flush data for db: {}, table: {} after {} times retry, the last exception is",
                         database, table, numRetries, e);
                 // Terminal failure: no further retry will re-drive the state
-                // machine back to ACTIVE via complete(). Release FLUSHING or
-                // COMMITTING now so the manager's final drain / rollback paths
-                // observe a non-busy region. The manager will see this.e from
+                // machine back to ACTIVE via complete(). Release FLUSHING now
+                // so the manager's final drain / rollback paths observe a
+                // non-busy region. The manager will see this.e from
                 // callback() below and stop scheduling new work.
                 state.compareAndSet(State.FLUSHING, State.ACTIVE);
-                state.compareAndSet(State.COMMITTING, State.ACTIVE);
                 manager.callback(firstException);
                 return;
             }
