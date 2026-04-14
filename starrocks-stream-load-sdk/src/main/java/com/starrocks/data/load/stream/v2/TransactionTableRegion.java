@@ -813,6 +813,7 @@ public class TransactionTableRegion implements TableRegion {
             streamLoader.getExecutorService().submit(this::doCommit);
         } catch (Exception e) {
             LOG.error("Failed to submit commit task, db: {}, table: {}, label: {}", database, table, label, e);
+            state.compareAndSet(State.COMMITTING, State.ACTIVE);
             throw e;
         }
 
